@@ -11,6 +11,7 @@ import datetime
 import email.utils
 import fcntl
 import glob
+import grp
 import hashlib
 import json
 import math
@@ -20,6 +21,7 @@ import re
 import shutil
 import smtplib
 import socket
+import stat
 import threading
 import ssl
 import subprocess
@@ -30,7 +32,7 @@ import urllib.parse
 import urllib.request
 from email.message import EmailMessage
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 REPO = 'https://github.com/Zoaftware/php-security-watch'
 UA = 'php-security-watch/%s (+%s)' % (VERSION, REPO)
 DEFAULT_CONFIG = '/etc/php-security-watch.conf'
@@ -89,11 +91,12 @@ class ConfigError(Exception):
 
 # ---------------------------------------------------------------- helpers
 
-def sh(cmd, timeout=180, env=None, stdin=None):
-    """Run a command. Returns (exit code, stdout, stderr); never raises."""
+def sh(cmd, timeout=180, env=None, stdin=None, executable=None):
+    """Run a command. Returns (exit code, stdout, stderr); never raises.
+    `executable` runs that file while cmd[0] stays the program name it sees (busybox needs it)."""
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-                           env=env, input=stdin, encoding='utf-8', errors='replace')
+                           env=env, input=stdin, encoding='utf-8', errors='replace', executable=executable)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, '', 'timed out after %ss' % timeout
@@ -103,6 +106,77 @@ def sh(cmd, timeout=180, env=None, stdin=None):
 
 def which(name):
     return shutil.which(name, path=os.environ.get('PATH', '') + ':/usr/sbin:/sbin:/usr/local/sbin')
+
+
+def user_name(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return 'user id %d' % uid
+
+
+def group_name(gid):
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return 'group id %d' % gid
+
+
+def unsafe_part(real):
+    """The first part of a resolved path, from / down, that a user other than root (or the one running this
+    program) owns or can write to: (part, its owner's uid, why), or None when every part is safe."""
+    me = os.geteuid()
+    parts = [p for p in real.split('/') if p]
+    for i in range(len(parts) + 1):
+        part = '/' + '/'.join(parts[:i])
+        what = 'it' if part == real else part
+        try:
+            st = os.lstat(part)
+        except OSError as e:
+            return part, None, '%s cannot be read (%s)' % (what, e.strerror or e)
+        if stat.S_ISLNK(st.st_mode):
+            return part, st.st_uid, '%s changed while it was checked' % what
+        if st.st_uid not in (0, me):
+            return part, st.st_uid, '%s belongs to %s' % (what, user_name(st.st_uid))
+        if st.st_mode & stat.S_IWOTH:
+            return part, st.st_uid, '%s is writable by every user' % what
+        if st.st_mode & stat.S_IWGRP:
+            return part, st.st_uid, '%s is writable by the %s group' % (what, group_name(st.st_gid))
+    return None
+
+
+def trusted_exec(path):
+    """Can this program be run without running code that someone else put there? A program found by glob or
+    PATH (an nvm Node.js, a PHP in /opt, a venv Python) may belong to an app user; running it as root would
+    hand that user root. Trusted means: the real file (after every symlink) and every folder above it belong
+    to root or to the user running this program, and nobody else can write to them. Returns (ok, why not)."""
+    real = os.path.realpath(path)
+    try:
+        st = os.stat(real)
+    except OSError as e:
+        return False, 'it cannot be read (%s)' % (e.strerror or e)
+    if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o111:
+        return False, 'it is not an executable file'
+    bad = unsafe_part(real)
+    return (True, '') if bad is None else (False, bad[2])
+
+
+def did_not_run(ctx, check, path, why, detail=''):
+    """One warning per program that was found but not run because someone else could have replaced it."""
+    real = os.path.realpath(path)
+    key = 'not-run-' + real
+    if any(f.key == check + ':' + key for f in ctx.findings):
+        return
+    bad = unsafe_part(real)
+    if bad and bad[1] not in (0, os.geteuid(), None):
+        fix = 'Make %s owned by root and writable only by root (chown -R root:root %s && chmod -R go-w %s), or install it from the package manager.' % (
+            bad[0], bad[0], bad[0])
+    elif bad and bad[1] is not None:
+        fix = 'Make %s writable only by its owner (chmod go-w %s), or install it from the package manager.' % (bad[0], bad[0])
+    else:
+        fix = 'Make it owned by root and writable only by root, or install it from the package manager.'
+    ctx.add('warning', check, key, 'Did not run %s: %s, so running it%s could run someone else\'s code.' % (
+        real, why, ' as root' if os.geteuid() == 0 else ''), detail, fix)
 
 
 def read(path, limit=None, binary=False):
@@ -819,7 +893,11 @@ def restart_unit(unit):
     elif base in ('ssh', 'sshd'):
         test = [which('sshd') or '/usr/sbin/sshd', '-t']
     if test:
-        rc, out, err = sh(test, timeout=60)
+        real = os.path.realpath(test[0]) if os.path.isabs(test[0]) else None  # a bare name is not on this server
+        ok, why = trusted_exec(real) if real else (True, '')
+        if not ok:
+            return False, 'did not run its config test %s: %s, so it was left running as it was' % (real, why)
+        rc, out, err = sh(test, timeout=60, executable=real)
         if rc != 0:
             return False, 'config test failed, left running as it was: %s' % short(err or out, 200)
     action = 'reload' if FPM_UNITS.match(unit) else 'restart'
@@ -975,6 +1053,10 @@ def find_php(ctx):
         real = os.path.realpath(path)
         if real in seen or not os.access(real, os.X_OK) or os.path.isdir(real):
             continue
+        ok, why = trusted_exec(real)
+        if not ok:
+            did_not_run(ctx, 'php', real, why, 'Its PHP version and settings were not checked.')
+            continue
         fpm = 'fpm' in os.path.basename(real)
         if fpm:
             rc, out, _ = sh([real, '-v'], timeout=20)
@@ -993,6 +1075,8 @@ def find_php(ctx):
 
 
 def php_ini_risks(binary):
+    if not trusted_exec(binary)[0]:
+        return {}
     rc, out, _ = sh([binary, '-i'], timeout=30)
     vals = {}
     for key in ('allow_url_include', 'display_errors', 'expose_php'):
@@ -1191,6 +1275,13 @@ def check_services(ctx):
 
 NODE_GLOBS = ['/usr/bin/node', '/usr/local/bin/node', '/opt/*/bin/node', '/root/.nvm/versions/node/*/bin/node',
               '/home/*/.nvm/versions/node/*/bin/node', '/usr/local/n/versions/node/*/bin/node']
+NODE_VERSION_DIR = re.compile(r'/versions/node/v?(\d+\.\d+\.\d+)/bin/node$')  # nvm and n keep each version in its own folder
+
+
+def node_version_from_path(path):
+    """The Node.js version an nvm or n folder holds (.../versions/node/v20.11.1/bin/node), read without running it."""
+    m = NODE_VERSION_DIR.search(path)
+    return m.group(1) if m else None
 
 
 def check_runtimes(ctx):
@@ -1200,6 +1291,13 @@ def check_runtimes(ctx):
     for p in paths:
         real = os.path.realpath(p)
         if real in nodes or not os.access(real, os.X_OK):
+            continue
+        ok, why = trusted_exec(real)
+        if not ok:
+            if node_version_from_path(real):  # an nvm or n install in a user's folder: its folder names the version
+                nodes[real] = node_version_from_path(real)
+            else:
+                did_not_run(ctx, 'runtimes', real, why, 'Its Node.js version was not checked.')
             continue
         rc, out, _ = sh([real, '-v'], timeout=20)
         if rc == 0 and re.match(r'^v\d+\.\d+\.\d+', out.strip()):
@@ -1233,6 +1331,10 @@ def check_runtimes(ctx):
     for p in glob.glob('/usr/local/bin/python3*') + glob.glob('/opt/*/bin/python3*') + glob.glob('/usr/bin/python3*'):
         real = os.path.realpath(p)
         if real in pythons or not re.search(r'python3(\.\d+)?$', real) or not os.access(real, os.X_OK):
+            continue
+        ok, why = trusted_exec(real)
+        if not ok:
+            did_not_run(ctx, 'runtimes', real, why, 'Its Python version was not checked.')
             continue
         rc, out, err = sh([real, '-c', 'import sys;print("%d.%d.%d" % sys.version_info[:3])'], timeout=20)
         if rc == 0 and vkey(out.strip()):
@@ -2124,16 +2226,29 @@ def site_hosts(ctx):
                 hosts.append(u.hostname.lower())
         return sorted(set(hosts))
     names = set()
-    if which('nginx'):
-        rc, out, _ = sh([which('nginx'), '-T'], timeout=60)
-        for m in re.finditer(r'^\s*server_name\s+([^;]+);', out or '', re.M):
-            names.update(m.group(1).split())
+    nginx = which('nginx')
+    if nginx:
+        real = os.path.realpath(nginx)  # resolved once: what was checked is what runs
+        ok, why = trusted_exec(real)
+        if ok:
+            rc, out, _ = sh([nginx, '-T'], timeout=60, executable=real)
+            for m in re.finditer(r'^\s*server_name\s+([^;]+);', out or '', re.M):
+                names.update(m.group(1).split())
+        else:
+            did_not_run(ctx, 'sites', nginx, why, 'The site names in its config were not read.')
     for ctl in ('apachectl', 'apache2ctl', 'httpd'):
-        if which(ctl):
-            rc, out, err = sh([which(ctl), '-S'], timeout=60)
-            for m in re.finditer(r'(?:namevhost|alias)\s+(\S+)', (out or '') + (err or '')):
-                names.add(m.group(1))
-            break
+        path = which(ctl)
+        if not path:
+            continue
+        real = os.path.realpath(path)
+        ok, why = trusted_exec(real)
+        if not ok:
+            did_not_run(ctx, 'sites', real, why, 'The site names in its config were not read.')
+            continue
+        rc, out, err = sh([path, '-S'], timeout=60, executable=real)
+        for m in re.finditer(r'(?:namevhost|alias)\s+(\S+)', (out or '') + (err or '')):
+            names.add(m.group(1))
+        break
     for conf in glob.glob('/etc/caddy/Caddyfile'):
         for m in re.finditer(r'^([a-z0-9.\-, ]+)\s*\{', read(conf) or '', re.M):
             names.update(x.strip() for x in m.group(1).split(','))
@@ -2450,7 +2565,12 @@ def send_email(conf, subject, body):
     sendmail = which('sendmail') or '/usr/sbin/sendmail'
     if not os.path.exists(sendmail):
         raise RuntimeError('no SMTP_URL set and no sendmail on this server')
-    rc, out, err = sh([sendmail, '-t', '-oi'], stdin=msg.as_string(), timeout=60)
+    real = os.path.realpath(sendmail)  # resolved once: what was checked is what runs
+    ok, why = trusted_exec(real)
+    if not ok:
+        raise RuntimeError('did not run %s: %s, so running it could run someone else\'s code; '
+                           'make it owned by root or set SMTP_URL' % (real, why))
+    rc, out, err = sh([sendmail, '-t', '-oi'], stdin=msg.as_string(), timeout=60, executable=real)
     if rc != 0:
         raise RuntimeError('sendmail failed: ' + short(err or out, 200))
 

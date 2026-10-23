@@ -46,7 +46,8 @@ php-security-watch puts the whole server in one nightly check:
 - **Quiet by default.** One message only when something is new, got fixed or got worse, plus a weekly
   summary.
 - **Safe by default.** It only reads. Fix mode installs security updates only, tests each config
-  before a restart and never reboots.
+  before a restart and never reboots. It never runs a program that a user other than root could
+  have replaced (an nvm Node.js, a PHP in `/opt`): it tells you about it instead.
 - **Nothing to sign up for.** Free (MIT), one file, Python standard library only, no telemetry, no
   account, no service of ours in the middle.
 
@@ -98,8 +99,8 @@ You need a Linux server, root, and Python 3.6 or newer (already present on every
 Ubuntu, Debian, RHEL/Rocky/Alma, Fedora, Alpine and openSUSE; `--deps` installs it if missing).
 
 ```sh
-curl -fsSL https://github.com/Zoaftware/php-security-watch/archive/refs/tags/v1.0.0.tar.gz | tar xz
-cd php-security-watch-1.0.0
+curl -fsSL https://github.com/Zoaftware/php-security-watch/archive/refs/tags/v1.0.1.tar.gz | tar xz
+cd php-security-watch-1.0.1
 sudo ./install.sh --email you@example.com
 ```
 
@@ -355,8 +356,8 @@ Nothing else on the server is touched in report mode.
 Download the new release and run its installer; your config is kept.
 
 ```sh
-curl -fsSL https://github.com/Zoaftware/php-security-watch/archive/refs/tags/v1.0.0.tar.gz | tar xz
-cd php-security-watch-1.0.0 && sudo ./install.sh
+curl -fsSL https://github.com/Zoaftware/php-security-watch/archive/refs/tags/v1.0.1.tar.gz | tar xz
+cd php-security-watch-1.0.1 && sudo ./install.sh
 ```
 
 New settings, if any, appear in `/etc/php-security-watch.conf.new` to compare with yours.

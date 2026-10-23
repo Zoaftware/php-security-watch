@@ -10,9 +10,11 @@ import io
 import json
 import os
 import shutil
+import stat
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, '..', 'php-security-watch')
@@ -337,6 +339,144 @@ class WalkTest(unittest.TestCase):
             ctx = types.SimpleNamespace(conf={'SCAN_PATHS': www, 'SKIP_PATHS': ''}, walk_cut=None)
             files = [f for _, f in psw.walk_web_files(ctx)]
             self.assertEqual(files, ['index.php'])
+
+
+class TrustedExec(unittest.TestCase):
+    """A program that another user could replace is never run: running it as root would hand them root."""
+
+    def setUp(self):
+        self.base = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.base)
+        self.foreign = set()  # paths that act as if user 4242 owned them (a test cannot chown without root)
+        real_lstat, base, foreign = os.lstat, self.base, self.foreign
+
+        def lstat(path, *args, **kwargs):
+            st = real_lstat(path, *args, **kwargs)
+            p = os.fsdecode(os.fspath(path))
+            mode, uid = st.st_mode, st.st_uid
+            if p in foreign:
+                uid = 4242
+            elif p != base and not p.startswith(base + os.sep):
+                # The folders above the test folder (/tmp is writable by everyone, a CI checkout belongs to
+                # another user) act as normal root-owned system folders; the file type stays real.
+                mode, uid = stat.S_IFMT(mode) | 0o755, 0
+            return os.stat_result((mode, st.st_ino, st.st_dev, st.st_nlink, uid, st.st_gid, st.st_size,
+                                   st.st_atime, st.st_mtime, st.st_ctime))
+
+        patcher = mock.patch.object(psw.os, 'lstat', lstat)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.marker = os.path.join(self.base, 'ran')
+
+    def program(self, rel, prints='8.3.1'):
+        """An executable shell script that leaves a mark when it runs and prints a version."""
+        path = os.path.join(self.base, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        d = os.path.dirname(path)
+        while d != self.base:
+            os.chmod(d, 0o755)
+            d = os.path.dirname(d)
+        with open(path, 'w') as f:
+            f.write('#!/bin/sh\ntouch %s\necho %s\n' % (self.marker, prints))
+        os.chmod(path, 0o755)
+        return path
+
+    def ctx(self):
+        c = psw.load_config(None)
+        c['CHECK_URLS'] = 'auto'
+        ctx = psw.Ctx(c, FakeArgs())
+        ctx.findings = []
+        ctx.fetch = lambda source, url, *a, **k: [{'version': 'v20.1.1', 'security': True}] if source == 'nodejs.org' else []
+        return ctx
+
+    def test_root_owned_program_is_trusted(self):
+        self.assertEqual(psw.trusted_exec(self.program('usr/bin/php')), (True, ''))
+
+    def test_program_of_another_user_is_not_trusted(self):
+        path = self.program('opt/node/bin/node')
+        self.foreign.add(path)
+        ok, why = psw.trusted_exec(path)
+        self.assertFalse(ok)
+        self.assertEqual(why, 'it belongs to %s' % psw.user_name(4242))
+        self.foreign.add(os.path.join(self.base, 'opt', 'node'))
+        self.assertEqual(psw.trusted_exec(path), (False, '%s belongs to %s' % (os.path.join(self.base, 'opt', 'node'), psw.user_name(4242))))
+
+    def test_writable_folder_or_file_is_not_trusted(self):
+        path = self.program('opt/app/bin/python3')
+        bindir = os.path.dirname(path)
+        os.chmod(bindir, 0o775)
+        ok, why = psw.trusted_exec(path)
+        self.assertFalse(ok)
+        self.assertTrue(why.startswith(bindir + ' is writable by the ') and why.endswith(' group'), why)
+        os.chmod(bindir, 0o757)
+        self.assertEqual(psw.trusted_exec(path), (False, bindir + ' is writable by every user'))
+        os.chmod(bindir, 0o755)
+        os.chmod(path, 0o777)
+        self.assertEqual(psw.trusted_exec(path), (False, 'it is writable by every user'))
+        os.chmod(path, 0o644)
+        self.assertEqual(psw.trusted_exec(path), (False, 'it is not an executable file'))
+
+    def test_symlink_is_judged_by_its_target(self):
+        evil = self.program('home/bob/evil')
+        self.foreign.add(evil)
+        good = self.program('usr/bin/python3.12')
+        link = os.path.join(self.base, 'opt', 'app', 'bin', 'python3')
+        os.makedirs(os.path.dirname(link))
+        os.symlink(evil, link)
+        self.assertEqual(psw.trusted_exec(link), (False, 'it belongs to %s' % psw.user_name(4242)))
+        os.remove(link)
+        os.symlink(good, link)  # a venv pointing at the system Python is fine
+        self.assertEqual(psw.trusted_exec(link), (True, ''))
+
+    def test_node_version_from_nvm_and_n_folders(self):
+        self.assertEqual(psw.node_version_from_path('/home/bob/.nvm/versions/node/v20.11.1/bin/node'), '20.11.1')
+        self.assertEqual(psw.node_version_from_path('/usr/local/n/versions/node/18.19.0/bin/node'), '18.19.0')
+        self.assertIsNone(psw.node_version_from_path('/opt/node/bin/node'))
+
+    def test_untrusted_programs_are_never_run(self):
+        ctx = self.ctx()
+        php_bad = self.program('opt/php81/bin/php', '8.1.0')
+        self.foreign.add(os.path.join(self.base, 'opt', 'php81'))
+        php_ok = self.program('opt/php83/bin/php', '8.3.1')
+        nvm = self.program('home/bob/.nvm/versions/node/v20.1.0/bin/node', 'v20.1.0')
+        self.foreign.add(nvm)
+        node_bad = self.program('opt/node/bin/node', 'v22.0.0')
+        self.foreign.add(os.path.join(self.base, 'opt', 'node'))
+        nginx = self.program('usr/sbin/nginx', 'server_name shop.example.org;')
+        self.foreign.add(nginx)
+        found = {'nginx': nginx}
+        with mock.patch.object(psw, 'PHP_GLOBS', [php_bad]), \
+                mock.patch.object(psw, 'NODE_GLOBS', [nvm, node_bad]), \
+                mock.patch.object(psw, 'which', found.get):
+            self.assertEqual(psw.find_php(ctx), [])
+            psw.check_runtimes(ctx)
+            self.assertEqual(psw.site_hosts(ctx), [])
+            psw.site_hosts(ctx)  # called again by the sites check: still one warning
+        self.assertFalse(os.path.exists(self.marker), 'an untrusted program was run')
+        warned = sorted(f.key for f in ctx.findings if f.level == 'warning')
+        self.assertEqual(warned, ['php:not-run-' + php_bad, 'runtimes:not-run-' + node_bad, 'sites:not-run-' + nginx])
+        f = [x for x in ctx.findings if x.key == 'runtimes:not-run-' + node_bad][0]
+        opt_node = os.path.join(self.base, 'opt', 'node')
+        self.assertTrue(f.title.startswith('Did not run %s: %s belongs to ' % (node_bad, opt_node)), f.title)
+        self.assertIn('chown -R root:root %s && chmod -R go-w %s' % (opt_node, opt_node), f.fix)
+        # the nvm Node.js was not run either, but its folder names the version and it is still compared
+        behind = [x.title for x in ctx.findings if x.key == 'runtimes:node-behind-' + nvm]
+        self.assertEqual(behind, ['Node.js 20.1.0 at %s is missing 1 security release: 20.1.1.' % nvm])
+        with mock.patch.object(psw, 'PHP_GLOBS', [php_ok]), mock.patch.object(psw, 'which', found.get):
+            installs = psw.find_php(ctx)
+        self.assertEqual([(i['path'], i['version']) for i in installs], [(php_ok, '8.3.1')])
+        self.assertTrue(os.path.exists(self.marker), 'a trusted program should still run')
+
+    def test_untrusted_sendmail_is_not_run(self):
+        sendmail = self.program('usr/sbin/sendmail')
+        self.foreign.add(sendmail)
+        conf = psw.load_config(None)
+        conf['NOTIFY_EMAIL'] = 'admin@example.org'
+        with mock.patch.object(psw, 'which', {'sendmail': sendmail}.get):
+            with self.assertRaises(RuntimeError) as e:
+                psw.send_email(conf, 'subject', 'body')
+        self.assertIn('did not run %s' % sendmail, str(e.exception))
+        self.assertFalse(os.path.exists(self.marker))
 
 
 if __name__ == '__main__':

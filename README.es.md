@@ -36,7 +36,8 @@ php-security-watch revisa todo el servidor en una sola corrida cada noche:
 - **Callado por defecto.** Un solo mensaje cuando hay algo nuevo, algo se arregló o algo empeoró, más un
   resumen semanal.
 - **Seguro por defecto.** Solo lee. El modo fix instala solo parches de seguridad, prueba cada
-  configuración antes de reiniciar y nunca reinicia el servidor.
+  configuración antes de reiniciar y nunca reinicia el servidor. Nunca corre un programa que otro
+  usuario que no sea root pudo cambiar (un Node.js de nvm, un PHP en `/opt`): te avisa en vez de correrlo.
 - **Sin registrarte en nada.** Gratis (MIT), un solo archivo, solo la librería estándar de Python, sin
   telemetría, sin cuentas y sin servicios nuestros en el medio.
 
@@ -78,8 +79,8 @@ Necesitás un servidor Linux, acceso root y Python 3.6 o más nuevo (ya viene en
 RHEL/Rocky/Alma, Fedora, Alpine y openSUSE actuales; `--deps` lo instala si falta).
 
 ```sh
-curl -fsSL https://github.com/Zoaftware/php-security-watch/archive/refs/tags/v1.0.0.tar.gz | tar xz
-cd php-security-watch-1.0.0
+curl -fsSL https://github.com/Zoaftware/php-security-watch/archive/refs/tags/v1.0.1.tar.gz | tar xz
+cd php-security-watch-1.0.1
 sudo ./install.sh --email vos@ejemplo.com
 ```
 
