@@ -9,6 +9,10 @@ someone else finds it.
 
 [Español](README.es.md)
 
+![php-security-watch demo: install, nightly check, status and uninstall](docs/demo.gif)
+
+<sub>Real output from a fresh Ubuntu 26.04 container; the nightly check is sped up.</sub>
+
 Every night it looks at the whole server, not only PHP: the operating system, waiting security
 updates, every PHP binary and its settings, the libraries your sites ship (`composer.lock`,
 `package-lock.json`, …), WordPress, exposed services, signs of a break-in, and whether every site

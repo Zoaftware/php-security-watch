@@ -7,6 +7,10 @@ necesita tu atención, antes de que otro lo encuentre.
 [English](README.md) · Esta página resume lo esencial; la referencia completa (todas las opciones,
 el formato JSON, las preguntas frecuentes) está en el [README en inglés](README.md).
 
+![Demo de php-security-watch: instalar, la revisión nocturna, el estado y desinstalar](docs/demo.gif)
+
+<sub>Salida real en un contenedor nuevo de Ubuntu 26.04; la revisión nocturna va acelerada.</sub>
+
 ---
 
 ## Por qué usarlo
