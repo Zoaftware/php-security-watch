@@ -2077,7 +2077,7 @@ def check_intrusion(ctx):
         ctx.add('critical' if crashes >= 20 else 'warning', 'intrusion', 'fpm-crashes', 'PHP workers crashed %s in the last 24 hours (segmentation faults).' % plural(crashes, 'time'),
                 'Crashes can be a PHP or extension bug, or someone probing for a memory-corruption exploit.',
                 'Look at the PHP-FPM log for the URLs at those times, and make sure PHP has every security update.')
-    read_what = 'read %s PHP files%s' % ('{:,}'.format(scanned), ' (full scan)' if ctx.deep else ' changed in the last %d days' % ctx.conf['INTRUSION_DAYS'])
+    read_what = 'read %s %s%s' % ('{:,}'.format(scanned), 'PHP file' if scanned == 1 else 'PHP files', ' (full scan)' if ctx.deep else ' changed in the last %d days' % ctx.conf['INTRUSION_DAYS'])
     if not [f for f in ctx.findings if f.check == 'intrusion' and f.level in ATTENTION]:
         ctx.add('ok', 'intrusion', 'clean', 'No signs of intrusion (%s, upload folders, temp folders, processes, crontabs, SSH keys, crashes).' % read_what)
     else:

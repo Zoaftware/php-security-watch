@@ -317,7 +317,7 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(any('Possible web shell' in t and 'cache.php' in t for t in titles), titles)
         self.assertTrue(any('inside upload folders' in t for t in titles), titles)
         infos = [f['title'] for f in data['findings'] if f['level'] == 'info' and f['check'] == 'intrusion']
-        self.assertTrue(any(t.startswith('Web shell search: read ') and 'PHP files' in t for t in infos), infos)
+        self.assertTrue(any(t.startswith('Web shell search: read ') and 'PHP file' in t for t in infos), infos)
         self.assertFalse(any('index.php' in t for t in titles), titles)
         self.assertTrue(os.path.exists(os.path.join(d, 'state', 'last.txt')))
         self.assertTrue(os.path.exists(os.path.join(d, 'state', 'seen.json')))

@@ -9,6 +9,33 @@ el formato JSON, las preguntas frecuentes) está en el [README en inglés](READM
 
 ---
 
+## Por qué usarlo
+
+Tener un servidor PHP seguro es vigilar muchas cosas, y las herramientas de siempre ven solo un pedazo:
+
+- **El actualizador del sistema** (`unattended-upgrades`, `dnf-automatic`) parcha los paquetes del
+  sistema. Nunca mira las librerías de tus sitios, ni un PHP o un Node.js copiado a mano en `/opt`.
+- **`composer audit` y `npm audit`** revisan un proyecto, cuando alguien se acuerda de correrlos. Las
+  copias de prueba y las versiones viejas nunca se revisan.
+- **Las plataformas de seguridad completas** necesitan agentes, un servidor central y tiempo para
+  instalarlas y ajustarlas.
+
+php-security-watch revisa todo el servidor en una sola corrida cada noche:
+
+- **Ve lo que el actualizador no ve.** En su primera corrida en nuestro propio servidor, apt decía «no
+  hay actualizaciones de seguridad» mientras un Node.js instalado a mano no tenía un parche de seguridad
+  y una app de Python traía un certifi con certificados raíz comprometidos.
+- **Primero lo que los atacantes usan hoy.** Una falla de la lista de CISA de fallas explotadas
+  activamente que toca tu software sale como crítica.
+- **Cada hallazgo dice qué hacer**, en una línea simple.
+- **Nunca inventa un «todo bien».** Si una fuente no responde, o responde a medias, el informe lo dice.
+- **Callado por defecto.** Un solo mensaje cuando hay algo nuevo, algo se arregló o algo empeoró, más un
+  resumen semanal.
+- **Seguro por defecto.** Solo lee. El modo fix instala solo parches de seguridad, prueba cada
+  configuración antes de reiniciar y nunca reinicia el servidor.
+- **Sin registrarte en nada.** Gratis (MIT), un solo archivo, solo la librería estándar de Python, sin
+  telemetría, sin cuentas y sin servicios nuestros en el medio.
+
 ## Qué revisa
 
 Cada noche mira todo el servidor, no solo PHP:

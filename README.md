@@ -20,10 +20,37 @@ By default it **only reads and reports**. If you want, it can also install the s
 restart the affected services for you, testing each config first and checking the site still
 answers afterwards.
 
+## Why use it
+
+Keeping a PHP server safe means watching many things, and the usual tools each see one piece:
+
+- **The OS updater** (`unattended-upgrades`, `dnf-automatic`) patches system packages. It never looks
+  at the libraries inside your sites, or at a PHP or Node.js copied by hand into `/opt`.
+- **`composer audit` and `npm audit`** check one project, when someone remembers to run them. Staging
+  copies and old release folders are never checked.
+- **Full security platforms** need agents, a central server and time to set up and tune.
+
+php-security-watch puts the whole server in one nightly check:
+
+- **It sees what the updater misses.** On its first run on our own server, apt said "no security
+  updates waiting" while a hand-installed Node.js was missing a security release and a Python app
+  shipped a certifi with compromised root CAs.
+- **What attackers use today comes first.** A flaw on CISA's list of actively exploited
+  vulnerabilities that matches your software is reported as critical.
+- **Every finding says what to do**, in one plain line.
+- **It never fakes an "all clear".** If a source cannot be reached, or only partly, the report says so.
+- **Quiet by default.** One message only when something is new, got fixed or got worse, plus a weekly
+  summary.
+- **Safe by default.** It only reads. Fix mode installs security updates only, tests each config
+  before a restart and never reboots.
+- **Nothing to sign up for.** Free (MIT), one file, Python standard library only, no telemetry, no
+  account, no service of ours in the middle.
+
 ---
 
 ## Contents
 
+- [Why use it](#why-use-it)
 - [What it checks](#what-it-checks)
 - [Install](#install)
 - [First run](#first-run)
