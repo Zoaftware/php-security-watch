@@ -1,0 +1,13 @@
+[Unit]
+Description=Run php-security-watch every night
+Documentation=https://github.com/Zoaftware/php-security-watch
+
+[Timer]
+# install.sh sets the hour (--time) and the time zone (--timezone)
+OnCalendar=*-*-* 03:00:00
+# a run missed while the server was off happens at the next boot
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

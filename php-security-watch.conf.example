@@ -1,0 +1,84 @@
+# php-security-watch settings. One KEY=VALUE per line; lines starting with # are ignored.
+# Every key can also be set for one run with an environment variable: PSW_<KEY>=value
+# The installer keeps this file readable by root only (0600), because it can hold an SMTP password.
+
+# ---- What it may change --------------------------------------------------------------
+# report = only look and tell you (default). fix = also install pending security updates
+# and restart the services listed in RESTART_SERVICES so they use the patched code.
+MODE=report
+
+# Only used with MODE=fix. Every restart is preceded by a config test (php-fpm -t, nginx -t,
+# apachectl configtest, sshd -t) and followed by a check that the service is running again.
+#   none     restart nothing, only report what still runs old code
+#   php-fpm  reload PHP-FPM pools
+#   web      PHP-FPM + nginx / Apache / Caddy / LiteSpeed
+#   all-safe every service except databases, Docker/containerd, networking, dbus, systemd and
+#            other services that are never safe to bounce. The server itself is never rebooted.
+RESTART_SERVICES=none
+
+# Refresh the package lists (apt-get update) before looking for security updates.
+APT_UPDATE=yes
+
+# ---- Where your sites live -------------------------------------------------------------
+# Folders searched for lock files (composer.lock, package-lock.json...), WordPress and web shells.
+SCAN_PATHS=/var/www /srv /home /opt
+SCAN_MAX_DEPTH=6
+# Folders to leave out, separated by spaces (backups, huge media folders).
+SKIP_PATHS=
+
+# Users that run your sites (their crontabs, SSH keys and /tmp files are checked).
+# auto = the users of the running PHP-FPM / web server processes.
+WEB_USERS=auto
+
+# Sites to check over HTTPS: auto = every host name in nginx / Apache / Caddy,
+# none = skip, or a list such as: example.com shop.example.com
+CHECK_URLS=auto
+
+# PHP files changed in the last N days are read for web shell signatures every night.
+# A full read of every file happens on the first run, on the weekly digest day and with --deep.
+INTRUSION_DAYS=7
+
+# ---- News -------------------------------------------------------------------------------
+# Look at the flaws CISA added to its "actively exploited" list in the last N days.
+KEV_DAYS=30
+# Extra words to match in that list, for software this tool cannot detect (e.g. "Moodle Roundcube").
+KEV_EXTRA_KEYWORDS=
+
+# ---- Alerts ------------------------------------------------------------------------------
+# Leave both empty to only keep the reports in STATE_DIR.
+# Email: one or more addresses, separated by commas.
+NOTIFY_EMAIL=
+# Without SMTP_URL the local sendmail is used (postfix, exim, msmtp...).
+# smtps://smtp.example.com:465 (TLS) or smtp://smtp.example.com:587 (STARTTLS)
+SMTP_URL=
+SMTP_USER=
+# Better: put the password alone in a root-only file and point to it.
+SMTP_PASSWORD_FILE=
+SMTP_PASSWORD=
+MAIL_FROM=
+
+# Webhook: Slack or Discord incoming webhook, ntfy topic URL (https://ntfy.sh/your-topic),
+# Telegram (https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID>) or any URL that takes JSON.
+WEBHOOK_URL=
+WEBHOOK_FORMAT=auto
+
+# new       = only when something new needs attention, something got fixed, or on the digest day (default)
+# attention = every night that something needs attention or got fixed
+# always    = every night
+NOTIFY_WHEN=new
+# Weekly summary even when nothing changed: 1 = Monday ... 7 = Sunday, 0 = never.
+DIGEST_WEEKDAY=1
+# Repeat an alert that is still open after this many days.
+REMIND_DAYS=7
+
+# ---- Other --------------------------------------------------------------------------------
+# auto = also look at PHP inside running Docker containers and at the ports Docker publishes.
+DOCKER=auto
+# Seconds to wait for each online source.
+TIMEOUT=40
+STATE_DIR=/var/lib/php-security-watch
+
+# Findings you have reviewed and accept, separated by spaces: a CVE or advisory id
+# (CVE-2026-12345, PKSA-xxxx-xxxx-xxxx, GHSA-xxxx-xxxx-xxxx) or the key shown in last.json.
+# They stay in the report as "info" and never alert again.
+IGNORE=

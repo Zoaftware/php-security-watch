@@ -1,0 +1,14 @@
+[Unit]
+Description=php-security-watch: nightly security check of this PHP server
+Documentation=https://github.com/Zoaftware/php-security-watch
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/php-security-watch run --quiet
+# exit 1 means "something needs attention" (the report says what), not a failed run
+SuccessExitStatus=1
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=2h

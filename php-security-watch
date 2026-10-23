@@ -1,0 +1,2678 @@
+#!/usr/bin/env python3
+# php-security-watch - a nightly security watch for PHP servers.
+# https://github.com/Zoaftware/php-security-watch - MIT License - Copyright (c) 2026 Zoaftware
+#
+# One file, Python 3.6+ standard library only. Read-only by default (MODE=report).
+# Run `php-security-watch checks` to see everything it looks at.
+
+import argparse
+import concurrent.futures
+import datetime
+import email.utils
+import fcntl
+import glob
+import hashlib
+import json
+import math
+import os
+import pwd
+import re
+import shutil
+import smtplib
+import socket
+import threading
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from email.message import EmailMessage
+
+VERSION = '1.0.0'
+REPO = 'https://github.com/Zoaftware/php-security-watch'
+UA = 'php-security-watch/%s (+%s)' % (VERSION, REPO)
+DEFAULT_CONFIG = '/etc/php-security-watch.conf'
+
+DEFAULTS = {
+    'MODE': 'report',                 # report | fix
+    'RESTART_SERVICES': 'none',       # none | php-fpm | web | all-safe   (only used when MODE=fix)
+    'APT_UPDATE': 'yes',              # refresh apt lists before looking for security updates
+    'SCAN_PATHS': '/var/www /srv /home /opt',
+    'SCAN_MAX_DEPTH': '6',
+    'SKIP_PATHS': '',
+    'WEB_USERS': 'auto',
+    'CHECK_URLS': 'auto',             # auto | none | space separated host names or URLs
+    'INTRUSION_DAYS': '7',
+    'KEV_DAYS': '30',
+    'KEV_EXTRA_KEYWORDS': '',
+    'NOTIFY_EMAIL': '',
+    'SMTP_URL': '',
+    'SMTP_USER': '',
+    'SMTP_PASSWORD': '',
+    'SMTP_PASSWORD_FILE': '',
+    'MAIL_FROM': '',
+    'WEBHOOK_URL': '',
+    'WEBHOOK_FORMAT': 'auto',         # auto | slack | discord | ntfy | telegram | json
+    'NOTIFY_WHEN': 'new',             # new | attention | always
+    'DIGEST_WEEKDAY': '1',            # 1 = Monday ... 7 = Sunday, 0 = never
+    'REMIND_DAYS': '7',
+    'DOCKER': 'auto',                 # auto | no
+    'TIMEOUT': '40',
+    'STATE_DIR': '/var/lib/php-security-watch',
+    'IGNORE': '',
+}
+
+LEVELS = ('critical', 'warning', 'fixed', 'info', 'ok')
+RANK = dict((l, i) for i, l in enumerate(LEVELS))
+ATTENTION = ('critical', 'warning')
+
+CHECKS = [
+    ('os', 'Operating system still gets security updates (endoflife.date)'),
+    ('patches', 'Security updates waiting in apt, dnf, yum, apk or zypper; applies them in fix mode'),
+    ('reboot', 'Reboot pending and services still running replaced libraries; restarts them in fix mode'),
+    ('php', 'Every PHP on the server: version vs php.net security releases, end of life, risky settings, Docker'),
+    ('services', 'PHP-FPM, databases and caches listening on public interfaces, Docker published ports'),
+    ('runtimes', 'Node.js and Python versions vs their security releases and end of life'),
+    ('libraries', 'composer.lock, package-lock, yarn, pnpm, Python and Ruby dependencies vs Packagist and OSV'),
+    ('wordpress', 'WordPress core version, core file integrity, extra files, closed plugins'),
+    ('news', 'CISA actively exploited list, php.net security releases, Ubuntu security tracker'),
+    ('intrusion', 'Web shells, PHP in upload folders, programs in /tmp, odd processes, web user crontabs and keys, FPM crashes'),
+    ('sites', 'Every site still answers (before and after fixes), TLS expiry, exposed .env, .git, phpinfo, phpunit'),
+]
+
+
+class ConfigError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- helpers
+
+def sh(cmd, timeout=180, env=None, stdin=None):
+    """Run a command. Returns (exit code, stdout, stderr); never raises."""
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+                           env=env, input=stdin, encoding='utf-8', errors='replace')
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, '', 'timed out after %ss' % timeout
+    except OSError as e:
+        return 127, '', str(e)
+
+
+def which(name):
+    return shutil.which(name, path=os.environ.get('PATH', '') + ':/usr/sbin:/sbin:/usr/local/sbin')
+
+
+def read(path, limit=None, binary=False):
+    try:
+        with open(path, 'rb') as f:
+            data = f.read(limit) if limit else f.read()
+    except (OSError, IOError):
+        return None
+    return data if binary else data.decode('utf-8', 'replace')
+
+
+def plural(n, one, many=None):
+    return '%d %s' % (n, one if n == 1 else (many or one + 's'))
+
+
+def short(text, n=160):
+    text = ' '.join(str(text).split())
+    return text if len(text) <= n else text[:n - 1] + '…'
+
+
+def listing(items, n=6):
+    items = list(items)
+    return ', '.join(items[:n]) + (' and %d more' % (len(items) - n) if len(items) > n else '')
+
+
+def today():
+    return datetime.date.today()
+
+
+def utc(ts):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts))
+
+
+def parse_date(value):
+    """endoflife.date values are a date string, True or False."""
+    if isinstance(value, bool) or value is None:
+        return value
+    try:
+        return datetime.datetime.strptime(str(value)[:10], '%Y-%m-%d').date()
+    except ValueError:
+        return None
+
+
+PRE = {'dev': -4, 'alpha': -3, 'a': -3, 'beta': -2, 'b': -2, 'rc': -1, 'pl': 1, 'p': 1, 'patch': 1}
+
+
+def vkey(v):
+    """Comparable key for versions like 8.3.12, v5.7.8, 2.0.0-beta1, 1.2.3-p1. None if not a version."""
+    v = str(v).strip().lower()
+    v = re.sub(r'^v(?=\d)', '', v).split('+')[0]
+    m = re.match(r'^(\d+(?:\.\d+)*)(.*)$', v)
+    if not m:
+        return None
+    nums = [int(x) for x in m.group(1).split('.')][:6]
+    nums += [0] * (6 - len(nums))
+    rank, n = 0, 0
+    rest = m.group(2).lstrip('-._')
+    m2 = re.match(r'^(dev|alpha|beta|rc|patch|pl|a|b|p)\.?(\d*)', rest) if rest else None
+    if m2:
+        rank, n = PRE[m2.group(1)], int(m2.group(2) or 0)
+    return tuple(nums) + (rank, n)
+
+
+def vlt(a, b):
+    ka, kb = vkey(a), vkey(b)
+    return ka is not None and kb is not None and ka < kb
+
+
+def natural(s):
+    return [int(x) if x.isdigit() else x for x in re.split(r'(\d+)', s)]
+
+
+def constraint_match(version, constraint):
+    """Composer style constraints as used by Packagist advisories: '>=2.0.0,<2.10.2|<1.5.1'."""
+    v = vkey(version)
+    if v is None or not constraint:
+        return False
+    for alt in re.split(r'\s*\|\|?\s*', str(constraint).strip()):
+        alt = re.sub(r'(>=|<=|!=|==|>|<|=)\s+', r'\1', alt.strip())
+        parts = [p for p in re.split(r'\s*,\s*|\s+', alt) if p]
+        if not parts:
+            continue
+        ok = True
+        for p in parts:
+            m = re.match(r'^(>=|<=|!=|==|>|<|=)?v?(.+)$', p)
+            op, ver = (m.group(1) or '=='), m.group(2)
+            if ver == '*':
+                continue
+            if ver.endswith('.*'):
+                prefix = ver[:-2]
+                hit = vkey(version) is not None and (re.sub(r'^v', '', str(version)) + '.').startswith(prefix + '.')
+                if (op in ('==', '=') and not hit) or (op == '!=' and hit):
+                    ok = False
+                    break
+                continue
+            k = vkey(ver)
+            if k is None:
+                ok = False
+                break
+            c = (v > k) - (v < k)
+            if not {'>=': c >= 0, '<=': c <= 0, '>': c > 0, '<': c < 0, '==': c == 0, '=': c == 0, '!=': c != 0}[op]:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+def cvss3_score(vector):
+    """CVSS v3.x base score from a vector string, or None."""
+    try:
+        m = dict(x.split(':', 1) for x in vector.split('/')[1:])
+        scope = m['S']
+        av = {'N': 0.85, 'A': 0.62, 'L': 0.55, 'P': 0.2}[m['AV']]
+        ac = {'L': 0.77, 'H': 0.44}[m['AC']]
+        pr = {'N': 0.85, 'L': 0.62 if scope == 'U' else 0.68, 'H': 0.27 if scope == 'U' else 0.5}[m['PR']]
+        ui = {'N': 0.85, 'R': 0.62}[m['UI']]
+        cia = {'H': 0.56, 'L': 0.22, 'N': 0.0}
+        iss = 1 - (1 - cia[m['C']]) * (1 - cia[m['I']]) * (1 - cia[m['A']])
+    except (KeyError, ValueError, AttributeError):
+        return None
+    impact = 6.42 * iss if scope == 'U' else 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+    if impact <= 0:
+        return 0.0
+    expl = 8.22 * av * ac * pr * ui
+    base = min(impact + expl, 10) if scope == 'U' else min(1.08 * (impact + expl), 10)
+    i = int(round(base * 100000))
+    return i / 100000.0 if i % 10000 == 0 else (math.floor(i / 10000) + 1) / 10.0
+
+
+def severity_from_score(score):
+    if score is None:
+        return None
+    return 'critical' if score >= 9 else 'high' if score >= 7 else 'medium' if score >= 4 else 'low'
+
+
+# ---------------------------------------------------------------- config
+
+def load_config(path, required=False):
+    conf = dict(DEFAULTS)
+    unknown = []
+    if path and os.path.exists(path):
+        with open(path, encoding='utf-8') as f:
+            for n, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' not in line:
+                    raise ConfigError('%s line %d: expected KEY=VALUE' % (path, n))
+                k, v = line.split('=', 1)
+                k, v = k.strip().upper(), v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+                    v = v[1:-1]
+                if k not in DEFAULTS:
+                    unknown.append(k)
+                conf[k] = v
+    elif required:
+        raise ConfigError('config file %s not found' % path)
+    for k in DEFAULTS:
+        if 'PSW_' + k in os.environ:
+            conf[k] = os.environ['PSW_' + k]
+    checks = {
+        'MODE': ('report', 'fix'),
+        'RESTART_SERVICES': ('none', 'php-fpm', 'web', 'all-safe'),
+        'NOTIFY_WHEN': ('new', 'attention', 'always'),
+        'WEBHOOK_FORMAT': ('auto', 'slack', 'discord', 'ntfy', 'telegram', 'json'),
+        'DOCKER': ('auto', 'no'),
+        'APT_UPDATE': ('yes', 'no'),
+    }
+    for k, allowed in checks.items():
+        conf[k] = conf[k].strip().lower()
+        if conf[k] not in allowed:
+            raise ConfigError('%s=%s is not valid; use one of: %s' % (k, conf[k], ', '.join(allowed)))
+    for k in ('SCAN_MAX_DEPTH', 'INTRUSION_DAYS', 'KEV_DAYS', 'DIGEST_WEEKDAY', 'REMIND_DAYS', 'TIMEOUT'):
+        try:
+            conf[k] = int(conf[k])
+        except ValueError:
+            raise ConfigError('%s must be a number, got %r' % (k, conf[k]))
+    conf['_unknown'] = unknown
+    conf['_path'] = path
+    return conf
+
+
+# ---------------------------------------------------------------- findings and context
+
+class Finding(object):
+    def __init__(self, level, check, key, title, detail='', fix='', ids=()):
+        self.level, self.check, self.key = level, check, key
+        self.title, self.detail, self.fix = title, detail, fix
+        self.ids = list(ids)
+        self.new = False
+
+    def as_dict(self):
+        return {'level': self.level, 'check': self.check, 'key': self.key, 'title': self.title,
+                'detail': self.detail, 'fix': self.fix, 'ids': self.ids, 'new': self.new}
+
+
+class Ctx(object):
+    def __init__(self, conf, args):
+        self.conf = conf
+        self.args = args
+        self.fix = conf['MODE'] == 'fix' or bool(getattr(args, 'apply', False))
+        self.timeout = conf['TIMEOUT']
+        self.findings = []
+        self.sources = {}
+        self.source_counts = {}  # source -> [ok, failed, last error]
+        self.source_lock = threading.Lock()
+        self.cache = {}
+        self.root = os.geteuid() == 0
+        self.osr = os_release()
+        self.os_id = self.osr.get('ID', '').lower()
+        self.os_like = (self.osr.get('ID_LIKE', '') + ' ' + self.os_id).lower().split()
+        self.pm = detect_pm()
+        self.systemd = os.path.isdir('/run/systemd/system') and bool(which('systemctl'))
+        self.procs = list_processes()
+        self.web_users = detect_web_users(conf, self.procs)
+        self.packages = installed_packages(self.pm)
+        self.software = set(self.packages)
+        self.pending_security = []
+        self.php_installs = []
+        self.lib_advisories = {}
+        self.wordpress_roots = []
+        self.sites_before = None
+        self.deep = False
+        self.seen = {}
+        self.started = time.time()
+        self.ignore = set(conf['IGNORE'].split())
+
+    def add(self, level, check, key, title, detail='', fix='', ids=()):
+        f = Finding(level, check, check + ':' + key, title, detail, fix, ids)
+        if self.ignore and (f.key in self.ignore or self.ignore.intersection(f.ids)) and level in ATTENTION:
+            f.level, f.title = 'info', '(ignored by config) ' + title
+        self.findings.append(f)
+        return f
+
+    def fetch(self, source, url, data=None, headers=None, raw=False, timeout=None):
+        """HTTP GET/POST with a per-run cache. Records the source as ok or unavailable; returns None on failure."""
+        key = (url, json.dumps(data, sort_keys=True) if isinstance(data, (dict, list)) else data)
+        if key in self.cache:
+            return self.cache[key]
+        h = {'User-Agent': UA, 'Accept': 'application/json, */*'}
+        body = None
+        if isinstance(data, (dict, list)):
+            body = json.dumps(data).encode()
+            h['Content-Type'] = 'application/json'
+        elif isinstance(data, str):
+            body = data.encode()
+            h['Content-Type'] = 'application/x-www-form-urlencoded'
+        if headers:
+            h.update(headers)
+        out, err = None, None
+        for wait in (0, 3, 10):  # busy or briefly unreachable sources get two more tries
+            time.sleep(wait)
+            try:
+                req = urllib.request.Request(url, data=body, headers=h)
+                with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                    payload = r.read()
+                out = payload if raw else json.loads(payload.decode('utf-8', 'replace'))
+                err = None
+                break
+            except urllib.error.HTTPError as e:
+                err = e
+                if e.code != 429 and e.code < 500:
+                    break
+            except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
+                err = e
+            except Exception as e:  # bad JSON: retrying will not help
+                err = e
+                break
+        self.count_source(source, err)
+        self.cache[key] = out
+        return out
+
+    def count_source(self, source, err):
+        """A source is "ok" only when every request to it worked; partial failures are reported."""
+        with self.source_lock:
+            c = self.source_counts.setdefault(source, [0, 0, ''])
+            if err is None:
+                c[0] += 1
+            else:
+                c[1] += 1
+                c[2] = short(err, 90)
+            if not c[1]:
+                self.sources[source] = 'ok'
+            elif not c[0]:
+                self.sources[source] = 'unavailable (%s)' % c[2]
+            else:
+                self.sources[source] = 'partly unavailable (%d of %d requests failed, last: %s)' % (c[1], c[0] + c[1], c[2])
+
+
+def os_release():
+    out = {}
+    for line in (read('/etc/os-release') or read('/usr/lib/os-release') or '').splitlines():
+        if '=' in line:
+            k, v = line.split('=', 1)
+            out[k.strip()] = v.strip().strip('"\'')
+    return out
+
+
+def detect_pm():
+    for name, binary in (('apt', 'apt-get'), ('dnf', 'dnf'), ('yum', 'yum'), ('apk', 'apk'), ('zypper', 'zypper')):
+        if which(binary):
+            return name
+    return None
+
+
+def installed_packages(pm):
+    pkgs = {}
+    if pm == 'apt':
+        rc, out, _ = sh(['dpkg-query', '-W', '-f=${db:Status-Abbrev}\t${Package}\t${Version}\n'])
+        for line in out.splitlines():
+            p = line.split('\t')
+            if len(p) == 3 and p[0].startswith('ii'):
+                pkgs[p[1]] = p[2]
+    elif pm in ('dnf', 'yum', 'zypper'):
+        rc, out, _ = sh(['rpm', '-qa', '--qf', '%{NAME}\t%{VERSION}-%{RELEASE}\n'])
+        for line in out.splitlines():
+            p = line.split('\t')
+            if len(p) == 2:
+                pkgs[p[0]] = p[1]
+    elif pm == 'apk':
+        rc, out, _ = sh(['apk', 'info', '-v'])
+        for line in out.splitlines():
+            m = re.match(r'^(.+)-(\d[^-]*-r\d+)$', line.strip())
+            if m:
+                pkgs[m.group(1)] = m.group(2)
+    return pkgs
+
+
+def list_processes():
+    procs = []
+    for d in glob.glob('/proc/[0-9]*'):
+        pid = int(d.rsplit('/', 1)[1])
+        status = read(d + '/status') or ''
+        m = re.search(r'^Uid:\s+(\d+)', status, re.M)
+        n = re.search(r'^Name:\s+(.*)$', status, re.M)
+        if not m:
+            continue
+        uid = int(m.group(1))
+        try:
+            user = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            user = str(uid)
+        cmd = (read(d + '/cmdline', 4096) or '').replace('\0', ' ').strip()
+        try:
+            exe = os.readlink(d + '/exe')
+        except OSError:
+            exe = ''
+        procs.append({'pid': pid, 'uid': uid, 'user': user, 'name': n.group(1) if n else '', 'cmd': cmd, 'exe': exe})
+    return procs
+
+
+WEB_PROC = re.compile(r'^(php-fpm|php-cgi|php\d|lsphp|litespeed|lshttpd|nginx|apache2?|httpd|caddy|frankenphp|openresty)', re.I)
+
+
+def detect_web_users(conf, procs):
+    users = set()
+    if conf['WEB_USERS'] != 'auto':
+        users.update(conf['WEB_USERS'].split())
+    else:
+        for p in procs:
+            if p['uid'] != 0 and WEB_PROC.match(p['name'] or ''):
+                users.add(p['user'])
+        if not users:
+            for u in ('www-data', 'nginx', 'apache', 'http', 'www'):
+                try:
+                    pwd.getpwnam(u)
+                    users.add(u)
+                except KeyError:
+                    pass
+    users.discard('root')
+    return sorted(users)
+
+
+def has_software(ctx, name):
+    name = name.lower()
+    for s in ctx.software:
+        s = s.lower()
+        if s == name or s.startswith(name + '-') or s.startswith(name + '/') or re.match(re.escape(name) + r'\d', s):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- check: os
+
+EOL_PRODUCTS = {'ubuntu': 'ubuntu', 'debian': 'debian', 'rhel': 'rhel', 'almalinux': 'almalinux', 'rocky': 'rocky-linux',
+                'alpine': 'alpine-linux', 'centos': 'centos', 'fedora': 'fedora', 'amzn': 'amazon-linux',
+                'opensuse-leap': 'opensuse', 'sles': 'sles', 'ol': 'oracle-linux'}
+
+
+def pick_cycle(rows, version):
+    if not rows or not version:
+        return None
+    parts = version.split('.')
+    for cand in (version, '.'.join(parts[:2]), parts[0]):
+        for r in rows:
+            if str(r.get('cycle')) == cand:
+                return r
+    return None
+
+
+def check_os(ctx):
+    name = ctx.osr.get('PRETTY_NAME') or 'unknown Linux'
+    product = EOL_PRODUCTS.get(ctx.os_id)
+    if ctx.os_id == 'centos' and 'stream' in name.lower():
+        product = 'centos-stream'
+    if not product:
+        ctx.add('info', 'os', 'unknown', '%s: not in the end-of-life database, so its support dates were not checked.' % name)
+        return
+    rows = ctx.fetch('endoflife.date', 'https://endoflife.date/api/%s.json' % product)
+    row = pick_cycle(rows, ctx.osr.get('VERSION_ID', ''))
+    if rows is None:
+        return
+    if not row:
+        ctx.add('info', 'os', 'nocycle', '%s: release not found in endoflife.date (%s).' % (name, product))
+        return
+    eol, ext = parse_date(row.get('eol')), parse_date(row.get('extendedSupport'))
+    t = today()
+    if eol is True or (isinstance(eol, datetime.date) and eol < t):
+        if isinstance(ext, datetime.date) and ext >= t:
+            ctx.add('warning', 'os', 'standard-eol', '%s: standard security support ended%s.' % (
+                name, ' on %s' % eol if isinstance(eol, datetime.date) else ''),
+                'Only extended support (for example Ubuntu Pro / ESM or a paid vendor plan) keeps getting fixes, until %s.' % ext,
+                'Enable the extended support your vendor offers, or move the sites to a supported release.')
+        else:
+            ctx.add('critical', 'os', 'eol', '%s no longer gets security updates%s.' % (
+                name, ' (support ended %s)' % eol if isinstance(eol, datetime.date) else ''),
+                'New flaws in the kernel, OpenSSL, PHP packages and everything else on this server stay open forever.',
+                'Upgrade to a supported release of your distribution or move to a new server.')
+    elif isinstance(eol, datetime.date) and (eol - t).days <= 90:
+        ctx.add('warning', 'os', 'eol-soon', '%s stops getting security updates on %s (%d days).' % (name, eol, (eol - t).days),
+                fix='Plan the upgrade to the next supported release now.')
+    else:
+        ctx.add('ok', 'os', 'supported', '%s gets security updates%s.' % (
+            name, ' until %s' % eol if isinstance(eol, datetime.date) else ''))
+
+
+# ---------------------------------------------------------------- check: patches
+
+def apt_env():
+    env = dict(os.environ)
+    env.update({'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_SUSPEND': '1', 'NEEDRESTART_MODE': 'l',
+                'LC_ALL': 'C', 'APT_LISTCHANGES_FRONTEND': 'none'})
+    return env
+
+
+def parse_apt_simulation(text):
+    """Inst lines from `apt-get -s dist-upgrade` -> (security, other) lists of (package, old, new)."""
+    sec, other = [], []
+    for line in text.splitlines():
+        m = re.match(r'^Inst (\S+) (?:\[([^\]]*)\] )?\((\S+) (.*)\)', line)
+        if not m:
+            continue
+        item = (m.group(1), m.group(2) or '', m.group(3))
+        (sec if re.search(r'-security|Debian-Security|/updates\b', m.group(4), re.I) else other).append(item)
+    return sec, other
+
+
+def parse_dnf_updateinfo(text):
+    """`dnf updateinfo list --security` (dnf4) or `dnf advisory list --security` (dnf5) -> [(advisory, severity, package)]."""
+    out = []
+    for line in text.splitlines():
+        t = line.split()
+        if len(t) < 3 or not re.match(r'^[A-Z][A-Z0-9]*-', t[0]):
+            continue
+        sev = ''
+        for x in t[1:]:
+            m = re.match(r'^(Critical|Important|Moderate|Low|None)', x, re.I)
+            if m:
+                sev = m.group(1).lower()
+                break
+        pkg = next((x for x in t[1:] if re.search(r'-\d.*\.(x86_64|aarch64|noarch|i686|ppc64le|s390x|src)$', x)), t[-1])
+        out.append((t[0], sev, pkg))
+    return out
+
+
+def parse_apk_outdated(text):
+    out = []
+    for line in text.splitlines():
+        m = re.match(r'^(\S+?)-(\d\S*-r\d+)\s+<\s+(\S+)', line.strip())
+        if m:
+            out.append((m.group(1), m.group(2), m.group(3)))
+    return out
+
+
+def parse_zypper_patches(text):
+    out = []
+    for line in text.splitlines():
+        cols = [c.strip() for c in line.split('|')]
+        if len(cols) >= 6 and cols[2].lower() == 'security' and cols[5].lower() in ('needed', 'applicable'):
+            out.append((cols[1], cols[3].lower(), cols[6] if len(cols) > 6 else ''))
+    return out
+
+
+def pending_security_updates(ctx):
+    """Returns (items, level, note) where items are human readable package names."""
+    pm = ctx.pm
+    if pm == 'apt':
+        if ctx.conf['APT_UPDATE'] == 'yes' and ctx.root:
+            rc, _, err = sh(['apt-get', 'update', '-qq', '-o', 'DPkg::Lock::Timeout=300', '-o', 'Acquire::Retries=3'],
+                            timeout=600, env=apt_env())
+            if rc != 0:
+                ctx.add('warning', 'patches', 'apt-update', 'Could not refresh the package lists (apt-get update failed).',
+                        short(err, 300), 'Run `apt-get update` by hand and fix the repository error it shows.')
+        rc, out, err = sh(['apt-get', '-s', '-o', 'Debug::NoLocking=1', 'dist-upgrade'], timeout=300, env=apt_env())
+        if rc != 0:
+            return None, 'apt-get -s dist-upgrade failed: ' + short(err, 200)
+        sec, other = parse_apt_simulation(out)
+        return [(p, old, new, '') for p, old, new in sec], '%d other (non-security) updates waiting' % len(other)
+    if pm in ('dnf', 'yum'):
+        if pm == 'dnf':
+            rc, out, err = sh(['dnf', '-q', 'updateinfo', 'list', '--security'], timeout=600)
+            if rc != 0 and 'updateinfo' in err:
+                rc, out, err = sh(['dnf', '-q', 'advisory', 'list', '--security'], timeout=600)
+        else:
+            rc, out, err = sh(['yum', '-q', 'updateinfo', 'list', 'security'], timeout=600)
+        if rc not in (0, 100):
+            return None, '%s updateinfo failed: %s' % (pm, short(err, 200))
+        items = [(pkg, '', adv, sev) for adv, sev, pkg in parse_dnf_updateinfo(out)]
+        note = ''
+        if not items and ctx.os_id in ('centos',):
+            note = 'CentOS Stream does not publish security advisories, so security-only updates cannot be told apart'
+        return items, note
+    if pm == 'apk':
+        if ctx.root:
+            sh(['apk', 'update', '-q'], timeout=300)
+        rc, out, err = sh(['apk', 'version', '-l', '<'], timeout=300)
+        if rc != 0:
+            return None, 'apk version failed: ' + short(err, 200)
+        return [(p, old, new, '') for p, old, new in parse_apk_outdated(out)], \
+            'Alpine stable branches only ship security and bug fixes, so every pending upgrade is listed'
+    if pm == 'zypper':
+        rc, out, err = sh(['zypper', '-q', '--non-interactive', 'list-patches', '--category', 'security'], timeout=600)
+        if rc not in (0, 100):
+            return None, 'zypper list-patches failed: ' + short(err, 200)
+        return [(name, '', summary, sev) for name, sev, summary in parse_zypper_patches(out)], ''
+    return None, 'no supported package manager found (apt, dnf, yum, apk, zypper)'
+
+
+def apply_security_updates(ctx, items):
+    pm = ctx.pm
+    if pm == 'apt':
+        if which('unattended-upgrade'):
+            rc, out, err = sh(['unattended-upgrade', '-v'], timeout=3600, env=apt_env())
+        names = [p for p, _, _, _ in items]
+        still, _ = pending_security_updates(ctx)
+        left = [p for p, _, _, _ in (still or []) if p in names]
+        if left:
+            rc, out, err = sh(['apt-get', 'install', '--only-upgrade', '-y', '-q', '-o', 'DPkg::Lock::Timeout=300',
+                               '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold'] + left,
+                              timeout=3600, env=apt_env())
+            return rc == 0, err or out
+        return True, ''
+    cmd = {'dnf': ['dnf', '-y', '-q', 'upgrade', '--security'],
+           'yum': ['yum', '-y', '-q', 'update', '--security'],
+           'apk': ['apk', 'upgrade', '-q'],
+           'zypper': ['zypper', '-n', '-q', 'patch', '--category', 'security']}.get(pm)
+    if not cmd:
+        return False, 'unsupported package manager'
+    rc, out, err = sh(cmd, timeout=3600)
+    return rc in (0, 102, 103), err or out
+
+
+def auto_updates_state(ctx):
+    if ctx.pm == 'apt':
+        conf = ''.join(read(p) or '' for p in glob.glob('/etc/apt/apt.conf.d/*'))
+        on = re.search(r'APT::Periodic::Unattended-Upgrade\s+"?(\d+)"?', conf)
+        return bool(on and on.group(1) != '0' and which('unattended-upgrade')), 'unattended-upgrades'
+    if ctx.pm == 'dnf' and ctx.systemd:
+        for t in ('dnf-automatic-install.timer', 'dnf-automatic.timer', 'dnf5-automatic.timer'):
+            if sh(['systemctl', 'is-enabled', '--quiet', t])[0] == 0:
+                return True, 'dnf-automatic'
+        return False, 'dnf-automatic'
+    return None, ''
+
+
+def check_patches(ctx):
+    items, note = pending_security_updates(ctx)
+    if items is None:
+        ctx.add('warning', 'patches', 'unavailable', 'Could not check for security updates.', note,
+                'Run the package manager by hand to see the error.')
+        return
+    ctx.pending_security = [i[0] for i in items]
+    auto, tool = auto_updates_state(ctx)
+    if items and ctx.fix:
+        ok, out = apply_security_updates(ctx, items)
+        after, _ = pending_security_updates(ctx)
+        left = after or []
+        done = [i for i in items if i[0] not in [x[0] for x in left]]
+        if done:
+            ctx.add('fixed', 'patches', 'applied', 'Installed %s: %s.' % (plural(len(done), 'security update'),
+                    listing(i[0] for i in done)), '', '', [i[2] for i in done if i[2].startswith(('RHSA', 'ALSA', 'RLSA', 'ELSA', 'FEDORA', 'ALAS'))])
+        if left:
+            ctx.add('warning', 'patches', 'not-applied', '%s could not be installed: %s.' % (
+                plural(len(left), 'security update'), listing(i[0] for i in left)), short(out, 400),
+                'Run the upgrade by hand to see why (held package, broken dependency, full disk).')
+        ctx.pending_security = [i[0] for i in left]
+        items = left
+    elif items:
+        sev = set(i[3] for i in items)
+        level = 'critical' if sev.intersection({'critical'}) else 'warning'
+        ctx.add(level, 'patches', 'pending', '%s waiting to be installed: %s.' % (
+            plural(len(items), 'security update'), listing(i[0] for i in items)),
+            note if note and 'other' not in note else '',
+            'Install them now (%s) or set MODE=fix to let this tool install them every night.' % {
+                'apt': 'apt-get upgrade', 'dnf': 'dnf upgrade --security', 'yum': 'yum update --security',
+                'apk': 'apk upgrade', 'zypper': 'zypper patch --category security'}.get(ctx.pm, 'your package manager'),
+            [i[2] for i in items if re.match(r'^[A-Z]+-\d', i[2] or '')])
+    if not items:
+        ctx.add('ok', 'patches', 'none', 'No security updates waiting (%s).' % ctx.pm + (' %s.' % note if note else ''))
+    if auto is False:
+        ctx.add('info', 'patches', 'auto-off', 'Automatic security updates (%s) are off.' % tool,
+                fix='Turn them on, or set MODE=fix so this tool installs security updates each night.')
+    elif auto:
+        ctx.add('ok', 'patches', 'auto-on', 'Automatic security updates are on (%s).' % tool)
+
+
+# ---------------------------------------------------------------- check: reboot and stale libraries
+
+SKIP_MAP_PREFIX = ('/memfd:', '/dev/shm/', '/tmp/', '/var/tmp/', '/run/', '/SYSV', '/drm', '/[aio]', '/dev/zero', '/proc/')
+NEVER_RESTART = re.compile(r'^(dbus|systemd-|getty@|serial-getty@|user@|docker|containerd|podman|kubelet|k3s|libvirtd|'
+                           r'qemu|lxd|snapd|mysql|mysqld|mariadb|postgresql|mongod|redis|elasticsearch|opensearch|'
+                           r'networkmanager|networking|firewalld|ufw|nftables|iptables|wpa_supplicant|cloud-init|'
+                           r'multipathd|polkit|udisks2|lvm2|iscsid|open-vm-tools|vmtoolsd|qemu-guest-agent|walinuxagent|'
+                           r'google-guest-agent|amazon-ssm-agent|unattended-upgrades|packagekit|cron|crond)', re.I)
+WEB_UNITS = re.compile(r'^(nginx|apache2|httpd|caddy|lshttpd|lsws|openresty|openlitespeed|php.*fpm.*|.*php-fpm.*)\.service$', re.I)
+FPM_UNITS = re.compile(r'^(php.*fpm.*|.*php-fpm.*)\.service$', re.I)
+
+
+def unit_of(pid):
+    cg = read('/proc/%d/cgroup' % pid) or ''
+    if re.search(r'docker[-/]([0-9a-f]{12})|containerd|libpod-|/kubepods', cg):
+        m = re.search(r'docker[-/]([0-9a-f]{12})', cg)
+        return 'container ' + (m.group(1) if m else '?')
+    m = re.findall(r'/([^/\s]+\.service)', cg)
+    if m:
+        u = m[-1]
+        return 'user session' if u.startswith('user@') else u
+    if re.search(r'session-\w+\.scope', cg):
+        return 'user session'
+    if 'init.scope' in cg:
+        return 'systemd (PID 1)'
+    return None
+
+
+def stale_processes(ctx):
+    """pid -> list of replaced (deleted) libraries or binary still mapped by the process."""
+    stale = {}
+    for p in ctx.procs:
+        if p['pid'] == os.getpid():
+            continue
+        hits = set()
+        exe = p['exe']
+        if exe.endswith(' (deleted)') and not exe.startswith(SKIP_MAP_PREFIX):
+            hits.add(exe[:-10])
+        maps = read('/proc/%d/maps' % p['pid'])
+        for line in (maps or '').splitlines():
+            if not line.endswith(' (deleted)'):
+                continue
+            path = line.split(None, 5)[-1][:-10] if len(line.split(None, 5)) == 6 else ''
+            if path.startswith('/') and '.so' in path and not path.startswith(SKIP_MAP_PREFIX):
+                hits.add(path)
+        if hits:
+            stale[p['pid']] = sorted(hits)
+    return stale
+
+
+def group_stale(ctx, stale):
+    groups = {}
+    byname = dict((p['pid'], p) for p in ctx.procs)
+    for pid, libs in stale.items():
+        unit = unit_of(pid) if ctx.systemd else None
+        label = unit or ('process %s' % (byname.get(pid, {}).get('name') or pid))
+        g = groups.setdefault(label, {'pids': [], 'libs': set()})
+        g['pids'].append(pid)
+        g['libs'].update(os.path.basename(x) for x in libs)
+    return groups
+
+
+def kernel_pending():
+    running = os.uname().release
+    for base in ('/lib/modules', '/usr/lib/modules'):
+        try:
+            kernels = [k for k in os.listdir(base) if os.path.isdir(os.path.join(base, k))]
+        except OSError:
+            continue
+        if running in kernels:
+            newest = sorted(kernels, key=natural)[-1]
+            if newest != running and natural(newest) > natural(running):
+                return 'running kernel %s, newer kernel %s is installed' % (running, newest)
+        return None
+    return None
+
+
+def fpm_test_command(unit):
+    rc, out, _ = sh(['systemctl', 'show', '-p', 'ExecStart', unit])
+    m = re.search(r'argv\[\]=(\S+)([^;]*)', out)
+    if not m:
+        return None
+    args = [a for a in m.group(2).split() if a not in ('--nodaemonize', '-F', '--force-stderr', '-R', '--allow-to-run-as-root')]
+    return [m.group(1)] + args + ['-t']
+
+
+def restart_unit(unit):
+    """Config test first, then reload (PHP-FPM) or restart. Returns (ok, message)."""
+    base = unit[:-8] if unit.endswith('.service') else unit
+    test = None
+    if FPM_UNITS.match(unit):
+        test = fpm_test_command(unit)
+    elif base in ('nginx', 'openresty') and which(base):
+        test = [which(base), '-t']
+    elif base in ('apache2', 'httpd'):
+        test = [which('apachectl') or which('apache2ctl') or 'apachectl', 'configtest']
+    elif base in ('ssh', 'sshd'):
+        test = [which('sshd') or '/usr/sbin/sshd', '-t']
+    if test:
+        rc, out, err = sh(test, timeout=60)
+        if rc != 0:
+            return False, 'config test failed, left running as it was: %s' % short(err or out, 200)
+    action = 'reload' if FPM_UNITS.match(unit) else 'restart'
+    rc, out, err = sh(['systemctl', action, unit], timeout=180)
+    if rc != 0 and action == 'reload':
+        rc, out, err = sh(['systemctl', 'restart', unit], timeout=180)
+    time.sleep(2)
+    if sh(['systemctl', 'is-active', '--quiet', unit])[0] != 0:
+        sh(['systemctl', 'start', unit], timeout=180)
+        if sh(['systemctl', 'is-active', '--quiet', unit])[0] != 0:
+            return False, 'did not come back after %s: %s' % (action, short(err, 200))
+    return True, action
+
+
+def check_reboot(ctx):
+    reasons = []
+    if os.path.exists('/var/run/reboot-required'):
+        pk = (read('/var/run/reboot-required.pkgs') or '').split()
+        since = datetime.datetime.fromtimestamp(os.path.getmtime('/var/run/reboot-required')).strftime('%Y-%m-%d')
+        reasons.append('the system asks for it since %s%s' % (since, ' (%s)' % listing(sorted(set(pk)), 4) if pk else ''))
+    for cmd in (['needs-restarting', '-r'], ['dnf', '-q', 'needs-restarting', '-r']):
+        if which(cmd[0]):
+            rc, out, _ = sh(cmd, timeout=120)
+            if rc == 1:
+                reasons.append('needs-restarting says core libraries or the kernel were updated')
+            if rc in (0, 1):
+                break
+    k = kernel_pending()
+    if k:
+        reasons.append(k)
+    if reasons:
+        ctx.add('warning', 'reboot', 'pending', 'A reboot is needed to finish installing security updates.',
+                '; '.join(reasons) + '. This tool never reboots by itself.', 'Reboot the server at a quiet hour.')
+    else:
+        ctx.add('ok', 'reboot', 'none', 'No reboot pending.')
+    if not ctx.root:
+        return
+    groups = group_stale(ctx, stale_processes(ctx))
+    if ctx.fix and ctx.conf['RESTART_SERVICES'] != 'none' and ctx.systemd:
+        policy = ctx.conf['RESTART_SERVICES']
+        for label in sorted(groups):
+            if not label.endswith('.service'):
+                continue
+            allowed = (policy == 'php-fpm' and FPM_UNITS.match(label)) or \
+                      (policy == 'web' and WEB_UNITS.match(label)) or \
+                      (policy == 'all-safe' and not NEVER_RESTART.match(label))
+            if not allowed:
+                continue
+            ok, msg = restart_unit(label)
+            if ok:
+                ctx.add('fixed', 'reboot', 'restart-' + label, '%s %s so it uses the patched libraries.' % (
+                    'Reloaded' if msg == 'reload' else 'Restarted', label))
+            else:
+                ctx.add('critical' if 'did not come back' in msg else 'warning', 'reboot', 'restart-fail-' + label,
+                        'Could not restart %s: %s' % (label, msg), fix='Check `systemctl status %s`.' % label)
+        ctx.procs = list_processes()
+        groups = group_stale(ctx, stale_processes(ctx))
+    services = sorted(g for g in groups if g.endswith('.service'))
+    others = sorted(g for g in groups if not g.endswith('.service'))
+    if services:
+        libs = sorted(set().union(*[groups[s]['libs'] for s in services]))
+        ctx.add('warning', 'reboot', 'stale-services', '%s still run replaced (old, unpatched) code: %s.' % (
+            plural(len(services), 'service'), listing(services, 8)),
+            'Libraries: %s.' % listing(libs, 6),
+            'Restart them (`systemctl restart <name>`), or set MODE=fix with RESTART_SERVICES=php-fpm, web or all-safe.')
+    if others:
+        ctx.add('info', 'reboot', 'stale-other', 'Also running replaced code: %s.' % listing(others, 6),
+                fix='Containers need a restart; user sessions need a log out; PID 1 needs `systemctl daemon-reexec` or a reboot.')
+    if not groups:
+        ctx.add('ok', 'reboot', 'fresh', 'Every running service uses the current libraries.')
+
+
+# ---------------------------------------------------------------- check: php
+
+PHP_GLOBS = ['/usr/bin/php', '/usr/bin/php[0-9]*', '/usr/local/bin/php', '/usr/local/bin/php[0-9]*',
+             '/usr/sbin/php-fpm*', '/usr/local/sbin/php-fpm*', '/opt/remi/php*/root/usr/bin/php',
+             '/opt/remi/php*/root/usr/sbin/php-fpm', '/opt/cpanel/ea-php*/root/usr/bin/php',
+             '/opt/cpanel/ea-php*/root/usr/sbin/php-fpm', '/opt/plesk/php/*/bin/php', '/opt/plesk/php/*/sbin/php-fpm',
+             '/opt/alt/php*/usr/bin/php', '/usr/local/lsws/lsphp*/bin/php', '/usr/local/lsws/lsphp*/bin/lsphp',
+             '/opt/php*/bin/php', '/opt/php*/sbin/php-fpm', '/usr/local/php*/bin/php', '/usr/local/php*/sbin/php-fpm',
+             '/www/server/php/*/bin/php', '/www/server/php/*/sbin/php-fpm']
+
+
+def owner_of(ctx, path):
+    """The package that owns a file: {'pkg', 'version', 'vendor'} or None (compiled, Docker image, manual)."""
+    if ctx.pm == 'apt' and which('dpkg'):
+        rc, out, _ = sh(['dpkg', '-S', path])
+        if rc == 0 and out.strip():
+            pkg = out.split(': ')[0].split(',')[0].strip().split(':')[0]
+            return {'pkg': pkg, 'version': ctx.packages.get(pkg, ''), 'vendor': ''}
+    elif ctx.pm in ('dnf', 'yum', 'zypper') and which('rpm'):
+        rc, out, _ = sh(['rpm', '-qf', '--qf', '%{NAME}\t%{VERSION}-%{RELEASE}\t%{VENDOR}\n', path])
+        if rc == 0 and '\t' in out:
+            p = out.splitlines()[0].split('\t')
+            return {'pkg': p[0], 'version': p[1], 'vendor': p[2] if len(p) > 2 else ''}
+    elif ctx.pm == 'apk':
+        rc, out, _ = sh(['apk', 'info', '-W', path])
+        m = re.search(r'is owned by (\S+?)-(\d\S*-r\d+)', out)
+        if m:
+            return {'pkg': m.group(1), 'version': m.group(2), 'vendor': 'Alpine'}
+    return None
+
+
+def classify(ctx, owner):
+    """'upstream' = follows php.net/nodejs.org releases; 'vendor' = backports by a third party; 'distro' = backports."""
+    distro = ctx.osr.get('NAME', 'distribution')
+    if owner is None:
+        return 'upstream', 'not from a package (compiled, official Docker image or copied by hand)'
+    v, vendor, pkg = owner['version'].lower(), owner['vendor'].lower(), owner['pkg'].lower()
+    if 'sury' in v:
+        return 'upstream', '%s %s from packages.sury.org' % (owner['pkg'], owner['version'])
+    if 'remi' in v or 'remi' in vendor:
+        return 'upstream', '%s %s from the Remi repository' % (owner['pkg'], owner['version'])
+    if 'nodesource' in v or 'nodesource' in vendor:
+        return 'upstream', '%s %s from NodeSource' % (owner['pkg'], owner['version'])
+    if pkg.startswith('ea-php') or 'cpanel' in vendor:
+        return 'upstream', '%s %s from cPanel EasyApache' % (owner['pkg'], owner['version'])
+    if 'plesk' in pkg or 'plesk' in vendor:
+        return 'upstream', '%s %s from Plesk' % (owner['pkg'], owner['version'])
+    if pkg.startswith('alt-php') or 'cloudlinux' in vendor:
+        return 'vendor', '%s %s from CloudLinux (it backports fixes to old PHP branches)' % (owner['pkg'], owner['version'])
+    if ctx.os_id in ('alpine', 'fedora', 'arch'):
+        return 'upstream', '%s %s (%s ships upstream releases)' % (owner['pkg'], owner['version'], distro)
+    return 'distro', '%s %s from %s (it backports security fixes into this version)' % (owner['pkg'], owner['version'], distro)
+
+
+def php_releases(ctx, branch):
+    data = ctx.fetch('php.net', 'https://www.php.net/releases/index.php?json&version=%s&max=100' % branch)
+    out = {}
+    if isinstance(data, dict):
+        for ver, info in data.items():
+            if isinstance(info, dict) and vkey(ver):
+                d = None
+                try:
+                    d = datetime.datetime.strptime(info.get('date', ''), '%d %b %Y').date()
+                except ValueError:
+                    pass
+                out[ver] = {'date': d, 'security': 'security' in (info.get('tags') or [])}
+    return out
+
+
+def find_php(ctx):
+    seen = {}
+    paths = []
+    for g in PHP_GLOBS:
+        paths.extend(glob.glob(g))
+    if which('php'):
+        paths.append(which('php'))
+    for path in paths:
+        base = os.path.basename(path)
+        if re.search(r'config|ize|dbg|\.\w+$', base) and not re.match(r'^php\d+(\.\d+)?$', base):
+            continue
+        real = os.path.realpath(path)
+        if real in seen or not os.access(real, os.X_OK) or os.path.isdir(real):
+            continue
+        fpm = 'fpm' in os.path.basename(real)
+        if fpm:
+            rc, out, _ = sh([real, '-v'], timeout=20)
+        else:
+            rc, out, _ = sh([real, '-n', '-r', 'echo PHP_VERSION;'], timeout=20)
+        m = re.search(r'(\d+\.\d+\.\d+)', out or '')
+        if rc != 0 or not m:
+            continue
+        seen[real] = {'path': real, 'version': m.group(1), 'fpm': fpm}
+    installs = []
+    for real, item in sorted(seen.items()):
+        kind, label = classify(ctx, owner_of(ctx, real))
+        item.update({'kind': kind, 'label': label, 'branch': '.'.join(item['version'].split('.')[:2])})
+        installs.append(item)
+    return installs
+
+
+def php_ini_risks(binary):
+    rc, out, _ = sh([binary, '-i'], timeout=30)
+    vals = {}
+    for key in ('allow_url_include', 'display_errors', 'expose_php'):
+        m = re.search(r'^%s => (\S+)' % key, out or '', re.M)
+        if m:
+            vals[key] = m.group(1)
+    return vals
+
+
+def docker_ok(ctx):
+    return ctx.conf['DOCKER'] != 'no' and bool(which('docker')) and ctx.root
+
+
+def docker_containers(ctx):
+    if not docker_ok(ctx):
+        return []
+    rc, out, _ = sh(['docker', 'ps', '--format', '{{.ID}}|{{.Image}}|{{.Names}}|{{.Ports}}'], timeout=30)
+    rows = []
+    for line in out.splitlines() if rc == 0 else []:
+        p = line.split('|', 3)
+        if len(p) == 4:
+            rows.append({'id': p[0], 'image': p[1], 'name': p[2], 'ports': p[3]})
+    return rows
+
+
+DOCKER_PHP_PROBE = ('v=$(php -r "echo PHP_VERSION;" 2>/dev/null) || exit 0; p=$(readlink -f "$(command -v php)"); '
+                    'o=$( (dpkg -S "$p" 2>/dev/null | cut -d: -f1; rpm -qf "$p" 2>/dev/null; apk info -W "$p" 2>/dev/null) | head -1); '
+                    'echo "$v|$p|$o"')
+
+
+def check_php(ctx):
+    installs = find_php(ctx)
+    ctx.php_installs = installs
+    if installs:
+        ctx.software.add('php')
+    eol_rows = ctx.fetch('endoflife.date', 'https://endoflife.date/api/php.json') or []
+    t = today()
+    groups = {}
+    for i in installs:
+        groups.setdefault((i['version'], i['kind'], i['label']), []).append(i)
+    for (version, kind, label), items in sorted(groups.items()):
+        branch = '.'.join(version.split('.')[:2])
+        where = listing(sorted(x['path'] for x in items), 4)
+        php_branch_findings(ctx, 'host', version, branch, kind, label, where, eol_rows, t)
+        fpm = [x for x in items if x['fpm']]
+        risky = php_ini_risks(fpm[0]['path']) if fpm else {}
+        if risky.get('allow_url_include', '').lower() in ('on', '1'):
+            ctx.add('critical', 'php', 'ini-url-include-' + branch, 'PHP %s allows remote include (allow_url_include=On).' % branch,
+                    'Any file-inclusion bug in a site becomes remote code execution.', 'Set allow_url_include = Off in php.ini and reload PHP-FPM.')
+        if risky.get('display_errors', '').lower() in ('on', '1', 'stdout'):
+            ctx.add('warning', 'php', 'ini-display-errors-' + branch, 'PHP-FPM %s shows errors to visitors (display_errors=On).' % branch,
+                    'Error pages leak file paths, queries and sometimes passwords.', 'Set display_errors = Off and log_errors = On in the FPM php.ini.')
+        if risky.get('expose_php', '').lower() in ('on', '1'):
+            ctx.add('info', 'php', 'ini-expose-' + branch, 'PHP-FPM %s announces its exact version in every response (expose_php=On).' % branch,
+                    fix='Set expose_php = Off so scanners cannot match your version to known flaws so easily.')
+    if not installs:
+        ctx.add('info', 'php', 'none', 'No PHP binary found on the host.')
+    for c in docker_containers(ctx):
+        rc, out, _ = sh(['docker', 'exec', c['id'], 'sh', '-c', DOCKER_PHP_PROBE], timeout=30)
+        line = (out or '').strip().splitlines()
+        if rc != 0 or not line or '|' not in line[-1]:
+            continue
+        v, path, owner = (line[-1].split('|') + ['', ''])[:3]
+        if not vkey(v):
+            continue
+        ctx.software.add('php')
+        kind = 'upstream'
+        label = 'inside container %s (%s)' % (c['name'], c['image'])
+        if owner and not re.search(r'sury|remi', owner, re.I) and not owner.startswith('php8') and 'alpine' not in c['image']:
+            if re.search(r'php\d', owner) and not re.search(r'-r\d+$', owner):
+                kind, label = 'distro', label + ', distribution package ' + owner
+        php_branch_findings(ctx, 'docker-' + c['name'], v, '.'.join(v.split('.')[:2]), kind, label, path, eol_rows, t)
+
+
+def php_branch_findings(ctx, scope, version, branch, kind, label, where, eol_rows, t):
+    key = '%s-%s' % (scope, version)
+    row = next((r for r in eol_rows if str(r.get('cycle')) == branch), None)
+    eol = parse_date(row.get('eol')) if row else None
+    dead = eol is True or (isinstance(eol, datetime.date) and eol < t)
+    if kind == 'upstream':
+        rel = php_releases(ctx, branch)
+        newer = sorted([v for v in rel if vlt(version, v)], key=vkey)
+        sec = [v for v in newer if rel[v]['security']]
+        if dead:
+            ctx.add('critical', 'php', 'eol-' + key, 'PHP %s (%s) is past end of life%s: php.net no longer fixes its security flaws.' % (
+                version, label, ' since %s' % eol if isinstance(eol, datetime.date) else ''), 'Found at %s.' % where,
+                'Move the sites to a supported branch (%s).' % listing(str(r['cycle']) for r in eol_rows[:3]
+                                                                     if not (parse_date(r.get('eol')) is True or (isinstance(parse_date(r.get('eol')), datetime.date) and parse_date(r.get('eol')) < t))))
+        if sec:
+            ctx.add('critical', 'php', 'behind-' + key, 'PHP %s (%s) is missing %s: %s.' % (
+                version, label, plural(len(sec), 'security release'), listing(sec, 5)),
+                'Found at %s. Latest %s release: %s.' % (where, branch, newer[-1]),
+                'Update PHP to %s or later and reload PHP-FPM.' % newer[-1])
+        elif newer:
+            ctx.add('info', 'php', 'behind-' + key, 'PHP %s (%s): bug-fix release %s is available.' % (version, label, newer[-1]),
+                    'Found at %s.' % where)
+        elif rel and not dead:
+            ctx.add('ok', 'php', 'current-' + key, 'PHP %s (%s) is the latest %s release.' % (version, label, branch), 'Found at %s.' % where)
+        elif not rel and ctx.sources.get('php.net') == 'ok':
+            ctx.add('info', 'php', 'unknown-' + key, 'PHP %s (%s): php.net lists no releases for branch %s.' % (version, label, branch))
+    else:
+        if dead:
+            ctx.add('info', 'php', 'eol-' + key, 'PHP %s (%s): php.net ended this branch%s; your vendor keeps patching it while your OS release is supported.' % (
+                version, label, ' on %s' % eol if isinstance(eol, datetime.date) else ''), 'Found at %s.' % where,
+                'Plan a move to a newer PHP branch; the patches check shows whether the vendor fixes are installed.')
+        else:
+            ctx.add('ok', 'php', 'distro-' + key, 'PHP %s (%s).' % (version, label),
+                    'Found at %s. The patches and news checks show whether its fixes are installed.' % where)
+    if isinstance(eol, datetime.date) and not dead and (eol - t).days <= 120:
+        ctx.add('warning', 'php', 'eol-soon-' + key, 'PHP %s security support ends on %s (%d days).' % (branch, eol, (eol - t).days),
+                fix='Plan the move of the sites to a newer PHP branch now.')
+
+
+# ---------------------------------------------------------------- check: services (listening ports)
+
+SENSITIVE_PORTS = {3306: 'MySQL/MariaDB', 5432: 'PostgreSQL', 6379: 'Redis', 11211: 'Memcached', 27017: 'MongoDB',
+                   9200: 'Elasticsearch', 5984: 'CouchDB', 2375: 'Docker API (no TLS)', 9000: 'PHP-FPM'}
+SENSITIVE_PROCS = re.compile(r'php-fpm|php-cgi|mysqld|mariadbd|postgres|redis-server|memcached|mongod|dockerd', re.I)
+
+
+def public_bind(addr):
+    a = addr.strip('[]')
+    if a in ('*', '0.0.0.0', '::', ''):
+        return 'all interfaces'
+    if a.startswith('127.') or a == '::1' or a.startswith('::ffff:127.'):
+        return None
+    if re.match(r'^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|fd|fe80)', a):
+        return 'private network %s' % a
+    return 'public address %s' % a
+
+
+def listeners():
+    rows = []
+    if which('ss'):
+        rc, out, _ = sh(['ss', '-ltnpH'])
+        if rc != 0:
+            rc, out, _ = sh(['ss', '-ltnp'])
+        for line in out.splitlines():
+            t = line.split()
+            if len(t) < 4 or t[0] not in ('LISTEN',):
+                continue
+            local = t[3]
+            proc = ' '.join(t[5:])
+            names = re.findall(r'\(\("([^"]+)"', proc) or re.findall(r'"([^"]+)"', proc)
+            addr, _, port = local.rpartition(':')
+            if port.isdigit():
+                rows.append((addr.split('%')[0], int(port), names[0] if names else ''))
+    elif which('netstat'):
+        rc, out, _ = sh(['netstat', '-ltnp'])
+        for line in out.splitlines():
+            t = line.split()
+            if len(t) >= 6 and t[0].startswith('tcp') and t[5] == 'LISTEN':
+                addr, _, port = t[3].rpartition(':')
+                name = t[6].split('/', 1)[1] if len(t) > 6 and '/' in t[6] else ''
+                if port.isdigit():
+                    rows.append((addr, int(port), name))
+    return rows
+
+
+def check_services(ctx):
+    found = False
+    for addr, port, name in listeners():
+        where = public_bind(addr)
+        if not where:
+            continue
+        is_fpm = bool(re.search(r'php-fpm|php-cgi|lsphp', name, re.I))
+        if not (is_fpm or SENSITIVE_PROCS.search(name) or port in SENSITIVE_PORTS):
+            continue
+        what = 'PHP-FPM' if is_fpm else SENSITIVE_PORTS.get(port, name)
+        if is_fpm or port in (9000, 2375):
+            level = 'warning' if where.startswith('private') else 'critical'
+            ctx.add(level, 'services', 'listen-%s-%d' % (addr, port), '%s listens on %s port %d.' % (what, where, port),
+                    'Anyone who can reach this port can run PHP code or control Docker on this server.',
+                    'Make it listen on 127.0.0.1 or a unix socket, or block the port in the firewall.')
+        else:
+            ctx.add('warning' if not where.startswith('private') else 'info', 'services', 'listen-%s-%d' % (addr, port),
+                    '%s (%s) listens on %s port %d.' % (what, name or 'process', where, port),
+                    'Databases and caches open to the internet are a top cause of data theft and ransom notes.',
+                    'Bind it to 127.0.0.1 (or a private network) and make sure the firewall blocks the port.')
+        found = True
+    for c in docker_containers(ctx):
+        for m in re.finditer(r'(0\.0\.0\.0|\[?::\]?):(\d+)->(\d+)/tcp', c['ports']):
+            cport = int(m.group(3))
+            if cport in SENSITIVE_PORTS:
+                level = 'critical' if cport in (9000, 2375) else 'warning'
+                ctx.add(level, 'services', 'docker-%s-%s' % (c['name'], m.group(2)),
+                        'Container %s publishes %s (port %s) on every interface.' % (c['name'], SENSITIVE_PORTS[cport], m.group(2)),
+                        'Docker opens published ports around ufw and firewalld rules, so the firewall does not protect it.',
+                        'Publish it as 127.0.0.1:%s:%d instead, or drop the port mapping.' % (m.group(2), cport))
+                found = True
+    if not found:
+        ctx.add('ok', 'services', 'none', 'PHP-FPM, databases and caches only listen on local or private addresses.')
+
+
+# ---------------------------------------------------------------- check: runtimes (Node.js, Python)
+
+NODE_GLOBS = ['/usr/bin/node', '/usr/local/bin/node', '/opt/*/bin/node', '/root/.nvm/versions/node/*/bin/node',
+              '/home/*/.nvm/versions/node/*/bin/node', '/usr/local/n/versions/node/*/bin/node']
+
+
+def check_runtimes(ctx):
+    t = today()
+    nodes = {}
+    paths = [p for g in NODE_GLOBS for p in glob.glob(g)] + ([which('node')] if which('node') else [])
+    for p in paths:
+        real = os.path.realpath(p)
+        if real in nodes or not os.access(real, os.X_OK):
+            continue
+        rc, out, _ = sh([real, '-v'], timeout=20)
+        if rc == 0 and re.match(r'^v\d+\.\d+\.\d+', out.strip()):
+            nodes[real] = out.strip().lstrip('v')
+    if nodes:
+        ctx.software.add('nodejs')
+        index = ctx.fetch('nodejs.org', 'https://nodejs.org/dist/index.json') or []
+        rows = ctx.fetch('endoflife.date', 'https://endoflife.date/api/nodejs.json') or []
+        for path, v in sorted(nodes.items()):
+            kind, label = classify(ctx, owner_of(ctx, path))
+            major = v.split('.')[0]
+            row = next((r for r in rows if str(r.get('cycle')) == major), None)
+            eol = parse_date(row.get('eol')) if row else None
+            dead = eol is True or (isinstance(eol, datetime.date) and eol < t)
+            sec = sorted([r['version'].lstrip('v') for r in index if r.get('security') and r['version'].lstrip('v').split('.')[0] == major
+                          and vlt(v, r['version'].lstrip('v'))], key=vkey)
+            if kind == 'distro':
+                ctx.add('ok' if not dead else 'info', 'runtimes', 'node-' + path, 'Node.js %s at %s (%s).' % (v, path, label))
+                continue
+            if dead:
+                ctx.add('critical', 'runtimes', 'node-eol-' + path, 'Node.js %s at %s is past end of life%s.' % (
+                    v, path, ' (%s)' % eol if isinstance(eol, datetime.date) else ''), label,
+                    'Move to a supported LTS line of Node.js.')
+            if sec:
+                ctx.add('critical', 'runtimes', 'node-behind-' + path, 'Node.js %s at %s is missing %s: %s.' % (
+                    v, path, plural(len(sec), 'security release'), listing(sec, 4)), label,
+                    'Update Node.js to %s or later and restart the apps that use it.' % sec[-1])
+            elif not dead and index:
+                ctx.add('ok', 'runtimes', 'node-' + path, 'Node.js %s at %s has every security release of its line.' % (v, path))
+    pythons = {}
+    for p in glob.glob('/usr/local/bin/python3*') + glob.glob('/opt/*/bin/python3*') + glob.glob('/usr/bin/python3*'):
+        real = os.path.realpath(p)
+        if real in pythons or not re.search(r'python3(\.\d+)?$', real) or not os.access(real, os.X_OK):
+            continue
+        rc, out, err = sh([real, '-c', 'import sys;print("%d.%d.%d" % sys.version_info[:3])'], timeout=20)
+        if rc == 0 and vkey(out.strip()):
+            pythons[real] = out.strip()
+    if pythons:
+        rows = ctx.fetch('endoflife.date', 'https://endoflife.date/api/python.json') or []
+        for path, v in sorted(pythons.items()):
+            kind, label = classify(ctx, owner_of(ctx, path))
+            row = next((r for r in rows if str(r.get('cycle')) == '.'.join(v.split('.')[:2])), None)
+            eol = parse_date(row.get('eol')) if row else None
+            if kind != 'distro' and (eol is True or (isinstance(eol, datetime.date) and eol < t)):
+                ctx.add('warning', 'runtimes', 'python-eol-' + path, 'Python %s at %s is past end of life%s.' % (
+                    v, path, ' (%s)' % eol if isinstance(eol, datetime.date) else ''), label,
+                    'Install a supported Python and point your tools at it.')
+    if not nodes and not pythons:
+        ctx.add('info', 'runtimes', 'none', 'No Node.js or extra Python found.')
+
+
+# ---------------------------------------------------------------- discovery (one walk for lock files, venvs, WordPress)
+
+PRUNE = {'node_modules', 'vendor', '.git', '.svn', '.hg', 'cache', '.cache', '.npm', '.composer', '.yarn', 'bower_components',
+         '__pycache__', '.pnpm-store', '.Trash', 'proc', 'sys'}
+LOCKFILES = {'composer.lock': 'Packagist', 'package-lock.json': 'npm', 'npm-shrinkwrap.json': 'npm', 'yarn.lock': 'npm',
+             'pnpm-lock.yaml': 'npm', 'Gemfile.lock': 'RubyGems', 'poetry.lock': 'PyPI', 'Pipfile.lock': 'PyPI',
+             'requirements.txt': 'PyPI'}
+
+
+def scan_roots(ctx):
+    skip = set(os.path.realpath(p) for p in ctx.conf['SKIP_PATHS'].split())
+    roots = []
+    for p in ctx.conf['SCAN_PATHS'].split():
+        if os.path.isdir(p) and os.path.realpath(p) not in skip:
+            roots.append(os.path.realpath(p))
+    return roots, skip
+
+
+def discover(ctx):
+    if 'discovery' in ctx.cache:
+        return ctx.cache['discovery']
+    roots, skip = scan_roots(ctx)
+    found = {'locks': [], 'venvs': [], 'wordpress': []}
+    visited = set()
+    stack = [(r, 0) for r in roots]
+    while stack:
+        d, depth = stack.pop()
+        real = os.path.realpath(d)
+        if real in visited or real in skip:
+            continue
+        visited.add(real)
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        names = set(e.name for e in entries)
+        if 'pyvenv.cfg' in names:
+            found['venvs'].append(d)
+            continue
+        if 'wp-includes' in names and 'wp-admin' in names and os.path.isfile(os.path.join(d, 'wp-includes', 'version.php')):
+            found['wordpress'].append(d)
+        for n in names:
+            if n in LOCKFILES and os.path.isfile(os.path.join(d, n)):
+                if n == 'requirements.txt' and 'poetry.lock' in names:
+                    continue
+                found['locks'].append((os.path.join(d, n), LOCKFILES[n]))
+        if depth >= ctx.conf['SCAN_MAX_DEPTH']:
+            continue
+        deploy = 'releases' in names and 'current' in names and os.path.islink(os.path.join(d, 'current'))
+        for e in entries:
+            try:
+                if not e.is_dir(follow_symlinks=False) or e.name in PRUNE:
+                    continue
+            except OSError:
+                continue
+            if deploy and e.name == 'releases':
+                continue
+            stack.append((e.path, depth + 1))
+        if deploy:
+            stack.append((os.path.realpath(os.path.join(d, 'current')), depth + 1))
+    ctx.cache['discovery'] = found
+    return found
+
+
+# ---------------------------------------------------------------- lock file parsers
+
+def parse_composer_lock(text):
+    data = json.loads(text)
+    out = []
+    for section, dev in (('packages', False), ('packages-dev', True)):
+        for p in data.get(section) or []:
+            if p.get('name') and p.get('version'):
+                out.append((p['name'].lower(), p['version'], dev))
+    return out
+
+
+def parse_package_lock(text):
+    data = json.loads(text)
+    out = set()
+    if isinstance(data.get('packages'), dict):
+        for path, p in data['packages'].items():
+            if not path or p.get('link') or not p.get('version'):
+                continue
+            name = p.get('name') or path.rsplit('node_modules/', 1)[-1]
+            out.add((name, p['version'], bool(p.get('dev'))))
+    else:
+        def walk(deps):
+            for name, p in (deps or {}).items():
+                if isinstance(p, dict) and p.get('version') and not str(p['version']).startswith(('file:', 'link:', 'git')):
+                    out.add((name, p['version'], bool(p.get('dev'))))
+                    walk(p.get('dependencies'))
+        walk(data.get('dependencies'))
+    return sorted(out)
+
+
+def parse_yarn_lock(text):
+    out = set()
+    for m in re.finditer(r'^"?((?:@[^@/\s",]+/)?[^@\s",]+)@[^\n]*:\s*\n(?:[ \t]+[^\n]*\n)*?[ \t]+version:?\s+"?([^"\s]+)"?', text, re.M):
+        out.add((m.group(1), m.group(2), False))
+    return sorted(out)
+
+
+def parse_pnpm_lock(text):
+    out = set()
+    for m in re.finditer(r"^  '?/?((?:@[^/\s']+/)?[^@/\s'(]+)[@/](\d[^(:'\s]*)'?(?:\(.*\))?:\s*$", text, re.M):
+        out.add((m.group(1), m.group(2), False))
+    return sorted(out)
+
+
+def parse_gemfile_lock(text):
+    out = set()
+    for m in re.finditer(r'^    ([A-Za-z0-9_.\-]+) \(([^)]+)\)$', text, re.M):
+        v = re.sub(r'-(x86|x64|aarch|arm|java|universal|mingw|darwin|mswin)\S*$', '', m.group(2))
+        out.add((m.group(1), v, False))
+    return sorted(out)
+
+
+def parse_poetry_lock(text):
+    out = set()
+    for m in re.finditer(r'^\[\[package\]\]\s*\nname\s*=\s*"([^"]+)"\s*\nversion\s*=\s*"([^"]+)"', text, re.M):
+        out.add((m.group(1).lower(), m.group(2), False))
+    return sorted(out)
+
+
+def parse_pipfile_lock(text):
+    data = json.loads(text)
+    out = set()
+    for section, dev in (('default', False), ('develop', True)):
+        for name, p in (data.get(section) or {}).items():
+            v = str(p.get('version', '')).lstrip('=')
+            if v:
+                out.add((name.lower(), v, dev))
+    return sorted(out)
+
+
+def parse_requirements(text):
+    out = set()
+    for line in text.splitlines():
+        m = re.match(r'^\s*([A-Za-z0-9_.\-]+)(?:\[[^\]]*\])?\s*==\s*([A-Za-z0-9_.+!\-]+)', line)
+        if m:
+            out.add((m.group(1).lower(), m.group(2), False))
+    return sorted(out)
+
+
+def parse_venv(path):
+    out = set()
+    for meta in glob.glob(os.path.join(path, 'lib', 'python3*', 'site-packages', '*.dist-info')):
+        m = re.match(r'^(.+?)-(\d[^-]*)\.dist-info$', os.path.basename(meta))
+        if m:
+            out.add((m.group(1).lower().replace('_', '-'), m.group(2), False))
+    return sorted(out)
+
+
+PARSERS = {'composer.lock': parse_composer_lock, 'package-lock.json': parse_package_lock,
+           'npm-shrinkwrap.json': parse_package_lock, 'yarn.lock': parse_yarn_lock, 'pnpm-lock.yaml': parse_pnpm_lock,
+           'Gemfile.lock': parse_gemfile_lock, 'poetry.lock': parse_poetry_lock, 'Pipfile.lock': parse_pipfile_lock,
+           'requirements.txt': parse_requirements}
+
+
+# ---------------------------------------------------------------- advisory sources
+
+def packagist_advisories(ctx, names):
+    """name -> list of Packagist security advisories (the same data `composer audit` uses)."""
+    out = {}
+    names = sorted(set(names))
+    for i in range(0, len(names), 100):
+        chunk = names[i:i + 100]
+        body = '&'.join('packages[]=' + urllib.parse.quote(n) for n in chunk)
+        data = ctx.fetch('Packagist', 'https://packagist.org/api/security-advisories/', data=body)
+        if data is None:
+            return None
+        adv = data.get('advisories') or {}
+        if isinstance(adv, dict):
+            for name, rows in adv.items():
+                out.setdefault(name.lower(), []).extend(rows or [])
+    return out
+
+
+def osv_details(ctx, vid):
+    d = ctx.fetch('OSV', 'https://api.osv.dev/v1/vulns/' + urllib.parse.quote(vid))
+    if not d:
+        return {'id': vid, 'aliases': [], 'summary': '', 'severity': None, 'fixed': []}
+    sev = (d.get('database_specific') or {}).get('severity')
+    sev = sev.lower().replace('moderate', 'medium') if isinstance(sev, str) else None
+    if not sev:
+        for s in d.get('severity') or []:
+            if str(s.get('type', '')).startswith('CVSS_V3'):
+                sev = severity_from_score(cvss3_score(s.get('score', '')))
+    return {'id': vid, 'aliases': d.get('aliases') or [], 'summary': d.get('summary') or short(d.get('details', ''), 120),
+            'severity': sev, 'affected': d.get('affected') or []}
+
+
+def osv_fixed(details, name):
+    fixed = []
+    for a in details.get('affected') or []:
+        if (a.get('package') or {}).get('name', '').lower() != name.lower():
+            continue
+        for r in a.get('ranges') or []:
+            for e in r.get('events') or []:
+                if e.get('fixed'):
+                    fixed.append(e['fixed'])
+    return sorted(set(fixed), key=lambda v: vkey(v) or ())
+
+
+def osv_query(ctx, ecosystem, pkgs):
+    """[(name, version, dev)] -> {(name, version): [details]}"""
+    results = {}
+    pkgs = list(pkgs)
+    for i in range(0, len(pkgs), 500):
+        chunk = pkgs[i:i + 500]
+        data = ctx.fetch('OSV', 'https://api.osv.dev/v1/querybatch', data={'queries': [
+            {'package': {'name': n, 'ecosystem': ecosystem}, 'version': v} for n, v, _ in chunk]})
+        if data is None:
+            return None
+        for (n, v, _), r in zip(chunk, data.get('results') or []):
+            ids = [x['id'] for x in (r or {}).get('vulns') or []]
+            if ids:
+                results[(n, v)] = ids
+    out = {}
+    budget = 300
+    for key, ids in results.items():
+        rows = []
+        for vid in ids:
+            if budget <= 0:
+                rows.append({'id': vid, 'aliases': [], 'summary': '', 'severity': None, 'affected': []})
+                continue
+            budget -= 1
+            rows.append(osv_details(ctx, vid))
+        out[key] = rows
+    return out
+
+
+SEV_LEVEL = {'critical': 'critical', 'high': 'critical', 'medium': 'warning', 'moderate': 'warning', 'low': 'info'}
+
+
+def check_libraries(ctx):
+    found = discover(ctx)
+    projects = []
+    for path, eco in found['locks']:
+        text = read(path, 30 * 1024 * 1024)
+        if text is None:
+            continue
+        try:
+            pkgs = PARSERS[os.path.basename(path)](text)
+        except (ValueError, KeyError, TypeError) as e:
+            ctx.add('info', 'libraries', 'parse-' + path, 'Could not read %s: %s' % (path, short(e, 80)))
+            continue
+        projects.append((path, eco, pkgs))
+    for venv in found['venvs']:
+        pkgs = parse_venv(venv)
+        if pkgs:
+            projects.append((venv, 'PyPI', pkgs))
+    if not projects:
+        ctx.add('info', 'libraries', 'none', 'No dependency lock files or Python environments found under %s.' % ctx.conf['SCAN_PATHS'])
+        return
+    composer_names = set(n for path, eco, pkgs in projects if eco == 'Packagist' for n, _, _ in pkgs)
+    ctx.software.update(composer_names)
+    advisories = packagist_advisories(ctx, composer_names) if composer_names else {}
+    by_eco = {}
+    for path, eco, pkgs in projects:
+        if eco != 'Packagist':
+            by_eco.setdefault(eco, set()).update(pkgs)
+    osv = {}
+    for eco, pkgs in by_eco.items():
+        res = osv_query(ctx, eco, sorted(pkgs))
+        if res is None:
+            osv[eco] = None
+        else:
+            osv.update(dict(((eco,) + k, v) for k, v in res.items()))
+            osv.setdefault(eco, {})
+    clean = []
+    for path, eco, pkgs in projects:
+        where = os.path.dirname(path) if os.path.isfile(path) else path
+        hits = []
+        if eco == 'Packagist':
+            if advisories is None:
+                continue
+            for name, version, dev in pkgs:
+                for a in advisories.get(name, []):
+                    if constraint_match(version, a.get('affectedVersions')):
+                        sev = (a.get('severity') or '').lower() or None
+                        hits.append({'pkg': name, 'version': version, 'dev': dev, 'id': a.get('advisoryId') or a.get('remoteId'),
+                                     'cve': a.get('cve') or '', 'title': a.get('title') or '', 'severity': sev, 'fixed': '',
+                                     'link': a.get('link') or ''})
+        else:
+            if osv.get(eco) is None and eco in osv:
+                continue
+            for name, version, dev in pkgs:
+                for dt in osv.get((eco, name, version), []):
+                    fixed = [f for f in osv_fixed(dt, name) if vlt(version, f)]
+                    cve = next((x for x in dt.get('aliases', []) if x.startswith('CVE-')), '')
+                    hits.append({'pkg': name, 'version': version, 'dev': dev, 'id': dt['id'], 'cve': cve,
+                                 'title': dt.get('summary', ''), 'severity': dt.get('severity'),
+                                 'fixed': fixed[0] if fixed else '', 'link': 'https://osv.dev/vulnerability/' + dt['id']})
+        if not hits:
+            clean.append(where)
+            continue
+        for h in hits:
+            ctx.lib_advisories.setdefault(h['cve'] or h['id'], []).append(where)
+        levels = [SEV_LEVEL.get(h['severity'] or '', 'warning') for h in hits]
+        # Build-only packages (dev) never run for visitors: they count as a warning at most.
+        levels = [l if not h['dev'] or RANK[l] >= RANK['warning'] else 'warning' for l, h in zip(levels, hits)]
+        level = min(levels, key=lambda l: RANK[l])
+        pk = sorted(set('%s %s%s' % (h['pkg'], h['version'], ' (dev)' if h['dev'] else '') for h in hits))
+        lines = ['%s %s: %s %s%s%s' % (h['pkg'], h['version'], h['cve'] or h['id'], '(%s) ' % h['severity'] if h['severity'] else '',
+                                       short(h['title'], 90), ' - fixed in %s' % h['fixed'] if h['fixed'] else '') for h in hits[:12]]
+        if any(h['dev'] for h in hits):
+            lines.append('(dev) = only used to build the site, never run for visitors, so it counts as a warning at most.')
+        tool = {'Packagist': 'composer update <package> --with-dependencies', 'npm': 'npm audit fix (or npm update <package>)',
+                'PyPI': 'pip install -U <package>', 'RubyGems': 'bundle update <package>'}[eco]
+        ctx.add(level, 'libraries', where + ':' + eco, '%s: %s with known security flaws (%s): %s.' % (
+            where, plural(len(pk), 'library', 'libraries'), {'Packagist': 'PHP', 'npm': 'JavaScript', 'PyPI': 'Python', 'RubyGems': 'Ruby'}[eco],
+            listing(pk, 5)), '\n'.join(lines) + ('\n... and %d more' % (len(hits) - 12) if len(hits) > 12 else ''),
+            'In %s run `%s`, test the site, deploy. This tool never changes application code.' % (where, tool),
+            sorted(set(h['cve'] or h['id'] for h in hits)))
+    if clean:
+        ctx.add('ok', 'libraries', 'clean', '%s with no known flaws: %s.' % (plural(len(clean), 'project'), listing(clean, 6)))
+
+
+# ---------------------------------------------------------------- check: wordpress
+
+def wp_plugins(root):
+    out = []
+    base = os.path.join(root, 'wp-content', 'plugins')
+    try:
+        slugs = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for slug in slugs:
+        d = os.path.join(base, slug)
+        if not os.path.isdir(d) or slug.startswith('.'):
+            continue
+        version = None
+        cands = [os.path.join(d, slug + '.php')] + sorted(glob.glob(os.path.join(d, '*.php')))
+        for f in cands:
+            head = read(f, 8192) or ''
+            if re.search(r'^\s*\*?\s*Plugin Name:', head, re.M | re.I):
+                m = re.search(r'^\s*\*?\s*Version:\s*([^\s*]+)', head, re.M | re.I)
+                version = m.group(1) if m else ''
+                break
+        if version is not None:
+            out.append((slug, version))
+    return out
+
+
+def md5_file(path):
+    h = hashlib.md5()
+    try:
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+    except (OSError, IOError):
+        return None
+    return h.hexdigest()
+
+
+def check_wordpress(ctx):
+    roots = discover(ctx)['wordpress']
+    ctx.wordpress_roots = roots
+    if not roots:
+        ctx.add('info', 'wordpress', 'none', 'No WordPress found under %s.' % ctx.conf['SCAN_PATHS'])
+        return
+    ctx.software.add('wordpress')
+    rows = ctx.fetch('endoflife.date', 'https://endoflife.date/api/wordpress.json') or []
+    t = today()
+    plugin_budget = 250
+    for root in roots:
+        vtext = read(os.path.join(root, 'wp-includes', 'version.php')) or ''
+        m = re.search(r"\$wp_version\s*=\s*'([^']+)'", vtext)
+        if not m:
+            continue
+        version = m.group(1)
+        loc = re.search(r"\$wp_local_package\s*=\s*'([^']+)'", vtext)
+        locale = loc.group(1) if loc else 'en_US'
+        branch = '.'.join(version.split('.')[:2])
+        row = next((r for r in rows if str(r.get('cycle')) == branch), None)
+        if rows and row:
+            latest = row.get('latest')
+            if latest and vlt(version, latest):
+                ctx.add('warning', 'wordpress', 'core-' + root, 'WordPress %s at %s is behind %s (same branch; these releases carry security fixes).' % (
+                    version, root, latest), fix='Update WordPress in wp-admin > Dashboard > Updates, or `wp core update --minor`.')
+            eol = parse_date(row.get('eol'))
+            if eol is True or (isinstance(eol, datetime.date) and eol < t):
+                ctx.add('warning', 'wordpress', 'core-eol-' + root, 'WordPress %s at %s: branch %s no longer gets security fixes.' % (
+                    version, root, branch), fix='Update to the current WordPress (%s).' % rows[0].get('latest'))
+            elif not (latest and vlt(version, latest)):
+                ctx.add('ok', 'wordpress', 'core-' + root, 'WordPress %s at %s is the latest of its branch.' % (version, root))
+        elif rows:
+            ctx.add('critical', 'wordpress', 'core-old-' + root, 'WordPress %s at %s is so old it is not in the support list.' % (version, root),
+                    fix='Update WordPress to %s.' % rows[0].get('latest'))
+        sums = ctx.fetch('wordpress.org', 'https://api.wordpress.org/core/checksums/1.0/?version=%s&locale=%s' % (
+            urllib.parse.quote(version), urllib.parse.quote(locale)))
+        checksums = (sums or {}).get('checksums')
+        if not isinstance(checksums, dict) and locale != 'en_US':
+            sums = ctx.fetch('wordpress.org', 'https://api.wordpress.org/core/checksums/1.0/?version=%s&locale=en_US' % urllib.parse.quote(version))
+            checksums = (sums or {}).get('checksums')
+        if isinstance(checksums, dict):
+            changed = []
+            for rel, md5 in checksums.items():
+                if rel.startswith('wp-content/'):
+                    continue
+                full = os.path.join(root, rel)
+                if os.path.isfile(full) and md5_file(full) != md5:
+                    changed.append(rel)
+            extra = []
+            for sub in ('wp-admin', 'wp-includes'):
+                for d, dirs, files in os.walk(os.path.join(root, sub)):
+                    for f in files:
+                        if re.search(r'\.(php\d?|phtml|phar|ico)$', f, re.I):
+                            rel = os.path.relpath(os.path.join(d, f), root)
+                            if rel not in checksums:
+                                extra.append(rel)
+            if changed or extra:
+                ctx.add('critical', 'wordpress', 'integrity-' + root, 'WordPress core at %s does not match wordpress.org: %s changed, %s added.' % (
+                    root, plural(len(changed), 'file'), plural(len(extra), 'file')),
+                    'Changed: %s\nAdded: %s' % (listing(changed, 10) or '-', listing(extra, 10) or '-'),
+                    'Changed or extra core files are a classic sign of a hacked site. Compare them, then reinstall core: `wp core download --force --skip-content --version=%s`.' % version,
+                    ['wp-integrity'])
+            else:
+                ctx.add('ok', 'wordpress', 'integrity-' + root, 'WordPress core files at %s match wordpress.org.' % root)
+        cfg = os.path.join(root, 'wp-config.php')
+        if not os.path.exists(cfg):
+            cfg = os.path.join(os.path.dirname(root), 'wp-config.php')
+        try:
+            if os.stat(cfg).st_mode & 0o004:
+                ctx.add('warning', 'wordpress', 'config-perm-' + root, '%s can be read by every user on the server.' % cfg,
+                        'It holds the database password and secret keys.', 'chmod 640 (owner + web server group) or 600.')
+        except OSError:
+            pass
+        outdated, closed = [], []
+        for slug, pv in wp_plugins(root):
+            if plugin_budget <= 0:
+                break
+            plugin_budget -= 1
+            info = ctx.fetch('wordpress.org', 'https://api.wordpress.org/plugins/info/1.0/%s.json' % urllib.parse.quote(slug))
+            if not isinstance(info, dict):
+                continue
+            if info.get('closed') or info.get('error') == 'closed':
+                closed.append((slug, info.get('reason') or 'unknown', info.get('closed_date') or ''))
+            elif info.get('version') and pv and vlt(pv, info['version']):
+                outdated.append('%s %s -> %s' % (slug, pv, info['version']))
+        for slug, reason, when in closed:
+            ctx.add('critical' if 'security' in reason else 'warning', 'wordpress', 'plugin-closed-%s-%s' % (root, slug),
+                    'Plugin "%s" at %s was closed on wordpress.org%s (reason: %s).' % (slug, root, ' on %s' % when if when else '', reason),
+                    'Closed plugins get no more fixes; closures for security issues mean a known flaw is unfixed.',
+                    'Remove the plugin or replace it with a maintained one.')
+        if outdated:
+            ctx.add('info', 'wordpress', 'plugins-' + root, '%s at %s: %s with newer versions: %s.' % (
+                'WordPress', root, plural(len(outdated), 'plugin'), listing(outdated, 6)),
+                fix='Update them in wp-admin > Plugins (many updates are security fixes), or `wp plugin update --all`.')
+
+
+# ---------------------------------------------------------------- check: news
+
+KEV_MAP = [
+    (r'\bphp\b', ['php']), (r'nginx', ['nginx']), (r'apache.*(http|server)', ['apache2', 'httpd']), (r'openssl', ['openssl']),
+    (r'openssh', ['openssh-server', 'openssh']), (r'linux.*kernel|kernel.*linux', ['linux']), (r'\bsudo\b', ['sudo']),
+    (r'glibc|gnu c library', ['libc6', 'glibc']), (r'mysql', ['mysql-server', 'mysql']), (r'mariadb', ['mariadb']),
+    (r'postgres', ['postgresql']), (r'redis', ['redis', 'redis-server']), (r'docker', ['docker', 'docker-ce', 'docker.io', 'moby']),
+    (r'wordpress', ['wordpress']), (r'node\.?js', ['nodejs']), (r'\bcurl\b', ['curl']), (r'\bexim\b', ['exim4', 'exim']),
+    (r'roundcube', ['roundcube']), (r'phpmyadmin', ['phpmyadmin']), (r'cpanel', ['cpanel']), (r'plesk', ['plesk']),
+    (r'webmin', ['webmin']), (r'laravel', ['laravel/framework']), (r'drupal', ['drupal/core', 'drupal']),
+    (r'joomla', ['joomla']), (r'magento|adobe commerce', ['magento']), (r'craft ?cms', ['craftcms/cms']),
+    (r'symfony', ['symfony']), (r'polkit', ['polkit', 'policykit-1']), (r'\bxz\b', ['xz-utils', 'xz']),
+    (r'\bcups\b', ['cups']), (r'samba', ['samba']), (r'postfix', ['postfix']), (r'dovecot', ['dovecot']),
+    (r'\bbind\b', ['bind9', 'bind']), (r'\bgit\b', ['git']), (r'imagemagick', ['imagemagick']), (r'ghostscript', ['ghostscript']),
+    (r'litespeed', ['openlitespeed', 'lsws']), (r'cyberpanel', ['cyberpanel']), (r'moodle', ['moodle']),
+    (r'nextcloud', ['nextcloud']), (r'gitlab', ['gitlab']), (r'jenkins', ['jenkins']), (r'zimbra', ['zimbra']),
+    (r'vbulletin', ['vbulletin']), (r'livewire', ['livewire/livewire']), (r'filament', ['filament/filament']),
+    (r'prestashop', ['prestashop']), (r'opencart', ['opencart']), (r'woocommerce', ['woocommerce']), (r'elementor', ['elementor']),
+]
+
+UBUNTU_WATCH = re.compile(r'^(php\d+\.\d+|nginx|apache2|openssl|openssh|sudo|glibc|curl|nodejs|python3\.\d+|mysql-\d+\.\d+|'
+                          r'mariadb|postgresql-\d+|git|libxml2|zlib|imagemagick|ghostscript|exim4|postfix|dovecot|bind9|'
+                          r'docker\.io(-app)?|containerd(-app)?|redis|memcached|linux|samba|polkit|systemd|xz-utils|libssh2?)$')
+UBUNTU_OPEN = ('needed', 'pending', 'deferred', 'needs-triage')
+
+
+def dpkg_lt(a, b):
+    return sh(['dpkg', '--compare-versions', a, 'lt', b])[0] == 0
+
+
+def ubuntu_sources():
+    rc, out, _ = sh(['dpkg-query', '-W', '-f=${db:Status-Abbrev}|${source:Package}|${source:Version}\n'])
+    src = {}
+    for line in out.splitlines():
+        p = line.split('|')
+        if len(p) == 3 and p[0].startswith('ii') and p[2]:
+            if p[1] not in src or dpkg_lt(p[2], src[p[1]]):
+                src[p[1]] = p[2]
+    rc, out, _ = sh(['dpkg-query', '-W', '-f=${source:Version}', 'linux-modules-' + os.uname().release])
+    if rc == 0 and out.strip():
+        src['linux'] = out.strip()
+    return src
+
+
+def ubuntu_status(cve, codename):
+    rows = []
+    for p in cve.get('packages') or []:
+        for s in p.get('statuses') or []:
+            if s.get('release_codename') == codename:
+                rows.append((p.get('name'), s.get('status'), s.get('description') or ''))
+    return rows
+
+
+def check_news(ctx):
+    t = today()
+    is_ubuntu = ctx.os_id == 'ubuntu' and which('dpkg')
+    codename = ctx.osr.get('VERSION_CODENAME', '')
+    sources = ubuntu_sources() if is_ubuntu else {}
+    # 1. CISA Known Exploited Vulnerabilities
+    kev = ctx.fetch('CISA KEV', 'https://raw.githubusercontent.com/cisagov/kev-data/develop/known_exploited_vulnerabilities.json', timeout=90) \
+        or ctx.fetch('CISA KEV', 'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json', timeout=90)
+    if kev:
+        since = (t - datetime.timedelta(days=ctx.conf['KEV_DAYS'])).isoformat()
+        recent = [v for v in kev.get('vulnerabilities') or [] if (v.get('dateAdded') or '') >= since]
+        extra = [k.lower() for k in ctx.conf['KEV_EXTRA_KEYWORDS'].split()]
+        ours = []
+        for v in recent:
+            text = ('%s %s' % (v.get('vendorProject', ''), v.get('product', ''))).lower()
+            hit = any(re.search(rx, text) and any(has_software(ctx, n) for n in names) for rx, names in KEV_MAP)
+            if hit or any(k in text for k in extra):
+                ours.append(v)
+        ctx.add('info', 'news', 'kev-summary', 'CISA added %s that attackers are already using in the last %d days; %d %s about software found here.' % (
+            plural(len(recent), 'flaw'), ctx.conf['KEV_DAYS'], len(ours), 'is' if len(ours) == 1 else 'are'))
+        for v in ours:
+            cid = v.get('cveID', '')
+            product = ('%s %s' % (v.get('vendorProject', ''), v.get('product', ''))).strip()
+            desc = short(v.get('shortDescription', ''), 220)
+            title = '%s (%s) is being exploited (CISA list since %s)' % (cid, product, v.get('dateAdded'))
+            if cid in ctx.lib_advisories:
+                ctx.add('critical', 'news', 'kev-' + cid, title + ' and it affects %s.' % listing(ctx.lib_advisories[cid], 3), desc,
+                        'Update that library now; see the libraries section.', [cid])
+                continue
+            if is_ubuntu:
+                detail = ctx.fetch('Ubuntu tracker', 'https://ubuntu.com/security/cves/%s.json' % cid)
+                rows = ubuntu_status(detail or {}, codename)
+                hit, patched = [], []
+                for name, status, fixed in rows:
+                    if name not in sources:
+                        continue
+                    if status == 'released' and fixed and not dpkg_lt(sources[name], fixed):
+                        patched.append(name)
+                    elif status == 'released' or status in UBUNTU_OPEN:
+                        hit.append('%s %s%s' % (name, sources[name], ' (fix: %s)' % fixed if fixed else ' (no Ubuntu fix yet)'))
+                if hit:
+                    ctx.add('critical', 'news', 'kev-' + cid, title + ' and it affects: %s.' % listing(hit, 4), desc,
+                            'Install the fix as soon as Ubuntu ships it (patches check), and apply the vendor mitigation meanwhile.', [cid])
+                elif patched:
+                    ctx.add('ok', 'news', 'kev-' + cid, title + '; already patched here (%s).' % listing(patched, 4), ids=[cid])
+                elif detail is not None:
+                    ctx.add('info', 'news', 'kev-' + cid, title + '; Ubuntu says no installed package is affected.', ids=[cid])
+                else:
+                    ctx.add('warning', 'news', 'kev-' + cid, title + '.', desc, 'Check that your version is patched.', [cid])
+                continue
+            if ctx.pm in ('dnf', 'yum'):
+                rc, out, _ = sh([ctx.pm, '-q', 'updateinfo', 'list', '--cve', cid], timeout=300)
+                if rc == 0 and out.strip():
+                    ctx.add('critical', 'news', 'kev-' + cid, title + ' and a fix is waiting to be installed.', desc,
+                            'Run `%s upgrade --cve %s` now.' % (ctx.pm, cid), [cid])
+                    continue
+            ctx.add('warning', 'news', 'kev-' + cid, title + '.', desc,
+                    'Check that the version you run is patched (%s).' % short(v.get('requiredAction', ''), 120), [cid])
+    # 2. php.net security releases in the last 14 days
+    branches = sorted(set([i['branch'] for i in ctx.php_installs])) or []
+    rows = ctx.fetch('endoflife.date', 'https://endoflife.date/api/php.json') or []
+    for r in rows[:4]:
+        e = parse_date(r.get('eol'))
+        if isinstance(e, datetime.date) and e >= t:
+            branches.append(str(r['cycle']))
+    lines = []
+    for b in sorted(set(branches), key=natural, reverse=True):
+        for ver, info in php_releases(ctx, b).items():
+            if info['security'] and info['date'] and (t - info['date']).days <= 14:
+                lines.append('PHP %s (%s)' % (ver, info['date']))
+    if lines:
+        ctx.add('info', 'news', 'php-releases', 'php.net security releases in the last 14 days: %s.' % listing(sorted(set(lines), key=natural, reverse=True), 6),
+                'The php check says whether each PHP on this server already has them.')
+    # 3. Ubuntu security tracker: fixes released but not installed, and serious flaws still waiting for a fix
+    if is_ubuntu and codename:
+        for src in sorted(s for s in sources if UBUNTU_WATCH.match(s)):
+            data = ctx.fetch('Ubuntu tracker', 'https://ubuntu.com/security/cves.json?package=%s&limit=20' % urllib.parse.quote(src))
+            if data is None:
+                continue
+            waiting = []
+            for cve in data.get('cves') or []:
+                prio = (cve.get('priority') or '').lower()
+                for name, status, fixed in ubuntu_status(cve, codename):
+                    if name != src:
+                        continue
+                    if status == 'released' and fixed and dpkg_lt(sources[src], fixed):
+                        ctx.add('warning', 'news', 'ubuntu-%s-%s' % (cve['id'], src), '%s: Ubuntu released the fix for %s (%s priority) in %s, but %s is installed.' % (
+                            src, cve['id'], prio or 'unknown', fixed, sources[src]), fix='Install the update (patches check).', ids=[cve['id']])
+                    elif status in UBUNTU_OPEN and prio in ('high', 'critical') and src != 'linux':
+                        ctx.add('warning', 'news', 'ubuntu-%s-%s' % (cve['id'], src), '%s: %s (%s priority) has no Ubuntu fix yet.' % (
+                            src, cve['id'], prio), short(cve.get('description', ''), 200),
+                            'Nothing to install yet; it installs with the next security update. Apply the upstream mitigation if there is one.', [cve['id']])
+                    elif status in UBUNTU_OPEN:
+                        waiting.append(cve['id'])
+            if waiting:
+                ctx.add('info', 'news', 'ubuntu-wait-' + src, '%s %s: %s of low or medium priority %s for an Ubuntu fix (%s).' % (
+                    src, sources[src], plural(len(waiting), 'flaw'), 'waits' if len(waiting) == 1 else 'wait', listing(waiting, 4)))
+
+
+# ---------------------------------------------------------------- check: intrusion
+
+PHP_EXT = re.compile(r'\.(php\d?|phtml|pht|phar|phps)$', re.I)
+UPLOAD_DIRS = {'uploads', 'upload', 'files', 'media', 'images', 'img', 'pictures', 'attachments', 'userfiles', 'user-uploads'}
+# (label, hints, back, ahead, pattern). A pattern only runs in a small window around each place where
+# one of its lowercase hints appears (from `back` bytes before to `ahead` bytes after), so the
+# 600,000-file scan of a busy server costs one read, one lower() and a few substring finds per file.
+VISITOR = (b'$_get', b'$_post', b'$_request', b'$_cookie')
+EXEC_WORDS = (b'eval', b'assert', b'create_function')
+SHELL_SIGNATURES = [
+    ('runs decoded data', (b'eval', b'assert'), 0, 200,
+     rb'\b(?:eval|assert)\s*\(\s*@?\s*(?:base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13|strrev|rawurldecode|hex2bin|convert_uudecode)\s*\('),
+    ('runs code sent by the visitor', EXEC_WORDS, 0, 200,
+     rb'\b(?:eval|assert|create_function)\s*\(\s*@?\s*(?:stripslashes\s*\(\s*)?\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\b'),
+    ('runs shell commands sent by the visitor', VISITOR, 60, 10,
+     rb'\b(?:system|passthru|shell_exec|exec|popen|proc_open|pcntl_exec)\s*\(\s*@?\s*\$_(?:GET|POST|REQUEST|COOKIE)\b'),
+    ('calls a function named by the visitor', VISITOR, 0, 160,
+     rb'\$_(?:GET|POST|REQUEST|COOKIE)\s*\[[^\]]{1,40}\]\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)'),
+    # Old libraries used /e legitimately; the backdoor feeds visitor input to it.
+    ('uses the preg_replace /e backdoor', (b'preg_replace',), 0, 400,
+     rb'preg_replace\s*\(\s*([\'"])[^\'"]{0,200}/[imsxuADSUX]*e[imsxuADSUX]*\1\s*,\s*[^,;]{0,80}\$_(?:GET|POST|REQUEST|COOKIE)'),
+    ('hides an include in escaped bytes', (b'include', b'require'), 0, 300,
+     rb'@?(?:include|require)(?:_once)?\s*\(?\s*["\'](?:\\x[0-9a-f]{2}|\\[0-7]{3}){6,}'),
+    ('matches a known web shell', (b'filesman', b'b374k', b'c99shell', b'r57shell', b'indoxploit', b'alfa_data', b'alfateam',
+                                   b'wso', b'sh3ll', b'$auth_pass'), 0, 80,
+     rb'FilesMan|b374k|c99shell|r57shell|IndoXploit|ALFA_DATA|AlfaTeam|WSO\s+\d\.\d|Sh3ll\b|\$auth_pass\s*=\s*["\'][0-9a-f]{32}'),
+]
+SHELL_SIGNATURES = [(label, hints, back, ahead, re.compile(rx, re.I)) for label, hints, back, ahead, rx in SHELL_SIGNATURES]
+# The lookbehind makes the engine start only at the beginning of a run, which keeps it linear on long strings.
+BLOB = re.compile(rb'(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{4000,}={0,2}')
+BLOB_EXEC = re.compile(rb'\b(?:eval|assert|create_function)\s*\(', re.I)
+ODD_CMD = re.compile(r'(^|[ /])(nc|ncat|socat|xmrig|kinsing|kdevtmpfsi|minerd|cpuminer|xmr-stak)( |$)|\bbash -i\b|\bsh -i\b|/dev/tcp/|'
+                     r'(curl|wget)\s[^|]*\|\s*(ba)?sh|python[0-9.]*\s+-c\s.*socket|perl\s+-e\s.*socket|php\s+-r\s.*(fsockopen|proc_open)')
+MINER = re.compile(r'xmrig|kinsing|kdevtmpfsi|minerd|cpuminer|xmr-stak|stratum\+tcp', re.I)
+CRON_OK = re.compile(r'artisan\s+schedule:run|wp-cron\.php|\bcron\.php\b|bin/console|\bwp\s+cron\b|occ\s+background|magento\s+cron:run')
+CRON_BAD = re.compile(r'(curl|wget|fetch)\s|/tmp/|/dev/shm|/var/tmp|base64|\bnc\b|bash\s+-c|sh\s+-c|python[0-9.]*\s+-c|perl\s+-e|\|\s*(ba)?sh\b|\.\w{1,4}\s*>/dev/null 2>&1\s*$')
+
+
+def scan_php_file(path):
+    text = read(path, 1024 * 1024, binary=True)
+    if not text:
+        return None
+    low = text.lower()
+    for label, hints, back, ahead, rx in SHELL_SIGNATURES:
+        if near(text, low, hints, back, ahead, rx):
+            return label
+    if near(text, low, EXEC_WORDS, 0, 40, BLOB_EXEC) and BLOB.search(text):
+        return 'hides a large encoded payload next to eval()'
+    return None
+
+
+def near(text, low, hints, back, ahead, rx):
+    """rx.search only in the windows around each hint found in the lowercased text."""
+    for h in hints:
+        i = low.find(h)
+        while i != -1:
+            if rx.search(text, max(0, i - back), i + len(h) + ahead):
+                return True
+            i = low.find(h, i + len(h))
+    return False
+
+
+def silence_index(path):
+    try:
+        if os.path.getsize(path) > 200:
+            return False
+    except OSError:
+        return False
+    return 'silence' in (read(path) or '').lower() or (read(path) or '').strip() in ('<?php', '<?php //', '')
+
+
+MAX_WEB_FILES = 3000000
+
+
+TEST_DIRS = {'tests', 'test', 'spec', '__tests__', 'fixtures'}
+
+
+def walk_web_files(ctx, max_files=MAX_WEB_FILES):
+    # Follows symlinked folders (sites often live on another disk), each real folder once.
+    roots, skip = scan_roots(ctx)
+    seen = set(roots)
+    n = 0
+    for root in roots:
+        for d, dirs, files in os.walk(root, followlinks=True):
+            keep = []
+            for x in dirs:
+                if x in ('node_modules', '.git', '.svn', '.cache', '.npm'):
+                    continue
+                real = os.path.realpath(os.path.join(d, x))
+                if real not in seen and real not in skip:
+                    seen.add(real)
+                    keep.append(x)
+            dirs[:] = keep
+            for f in files:
+                n += 1
+                if n > max_files:
+                    ctx.walk_cut = d
+                    return
+                yield d, f
+
+
+def check_intrusion(ctx):
+    since = time.time() - ctx.conf['INTRUSION_DAYS'] * 86400
+    uploads, shells, icons = [], [], []
+    scanned = 0
+    for d, f in walk_web_files(ctx):
+        path = os.path.join(d, f)
+        parts = set(p.lower() for p in d.split(os.sep))
+        is_php = bool(PHP_EXT.search(f))
+        if is_php and parts.intersection(UPLOAD_DIRS) and not silence_index(path) and 'vendor' not in parts:
+            uploads.append(path)
+        if f.lower().endswith('.ico') and '<?php' in (read(path, 2048) or ''):
+            icons.append(path)
+        if not is_php:
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if ctx.deep or max(st.st_mtime, st.st_ctime) >= since:
+            scanned += 1
+            why = scan_php_file(path)
+            if why:
+                shells.append((path, why))
+    # The same file kept in several releases is one finding; a sample inside a tests folder is a warning.
+    groups = {}
+    for path, why in shells:
+        digest = hashlib.sha1(read(path, 1024 * 1024, binary=True) or b'').hexdigest()
+        groups.setdefault((why, digest), []).append(path)
+    for (why, digest), paths in sorted(groups.items(), key=lambda g: g[1][0])[:30]:
+        paths.sort()
+        in_tests = all(set(p.lower() for p in x.split(os.sep)).intersection(TEST_DIRS) for x in paths)
+        where = paths[0] if len(paths) == 1 else '%d copies of the same file (%s)' % (len(paths), listing(paths, 3))
+        try:
+            changed = 'Changed %s.' % datetime.datetime.fromtimestamp(os.path.getmtime(paths[0])).strftime('%Y-%m-%d %H:%M')
+        except OSError:
+            changed = ''
+        if in_tests:
+            ctx.add('warning', 'intrusion', 'shell-' + digest[:16], 'Web shell code inside a tests folder: %s %s.' % (where, why), changed,
+                    'Probably a test sample. Make sure the tests folder cannot be opened from the web, then add this key to IGNORE.')
+        else:
+            ctx.add('critical', 'intrusion', 'shell-' + digest[:16], 'Possible web shell: %s %s.' % (where, why), changed,
+                    'Open the file. If you did not write it, take the site offline, remove the file, change every password and find how it got in (outdated plugin, weak FTP or panel password).')
+    if len(groups) > 30:
+        ctx.add('critical', 'intrusion', 'shells-more', '%d more files look like web shells.' % (len(groups) - 30))
+    if uploads:
+        ctx.add('critical', 'intrusion', 'uploads-' + hashlib.sha1('\n'.join(sorted(uploads)).encode()).hexdigest()[:12],
+                '%s inside upload folders: %s.' % (plural(len(uploads), 'PHP file'), listing(uploads, 5)),
+                'Upload folders should only hold images and documents; PHP there is how most hacked sites get controlled.',
+                'Delete the files you did not put there, and stop PHP from running in upload folders (nginx: location ~* /uploads/.*\\.php$ { deny all; }).')
+    for path in icons[:10]:
+        ctx.add('critical', 'intrusion', 'ico-' + path, '%s is an .ico file that contains PHP code.' % path,
+                fix='This is a known trick to hide a backdoor that another file includes. Remove it and search for the file that includes it.')
+    procs = ctx.procs
+    users = set(ctx.web_users)
+    for p in procs:
+        exe, cmd = p['exe'], p['cmd']
+        if p['user'] in users and re.match(r'^/(tmp|var/tmp|dev/shm)/', exe):
+            ctx.add('critical', 'intrusion', 'proc-tmp-%s' % exe, 'The web user %s runs a program from a temporary folder: %s (pid %d).' % (p['user'], exe, p['pid']),
+                    short(cmd, 200), 'Web servers never need this; it is almost always malware. Stop it, delete it and look for how it got in.')
+        elif MINER.search(cmd) or MINER.search(os.path.basename(exe)):
+            ctx.add('critical', 'intrusion', 'proc-miner-%s' % p['name'], 'A crypto-miner is running: %s (pid %d, user %s).' % (p['name'], p['pid'], p['user']), short(cmd, 200))
+        elif ODD_CMD.search(cmd):
+            ctx.add('critical' if p['user'] in users else 'warning', 'intrusion', 'proc-odd-%s-%s' % (p['user'], p['name']),
+                    'Odd process (reverse shell or download-and-run pattern): pid %d, user %s.' % (p['pid'], p['user']), short(cmd, 200),
+                    'If you did not start it, stop it and find out how it started.')
+    if ctx.root:
+        for tmp in ('/tmp', '/var/tmp', '/dev/shm'):
+            for d, dirs, files in os.walk(tmp):
+                if d.count(os.sep) - tmp.count(os.sep) >= 3:
+                    dirs[:] = []
+                for f in files:
+                    path = os.path.join(d, f)
+                    try:
+                        st = os.lstat(path)
+                        owner = pwd.getpwuid(st.st_uid).pw_name
+                    except (OSError, KeyError):
+                        continue
+                    if owner not in users or not (st.st_mode & 0o111) or not os.path.isfile(path):
+                        continue
+                    elf = (read(path, 4, binary=True) or b'') == b'\x7fELF'
+                    ctx.add('critical' if elf else 'warning', 'intrusion', 'tmp-exec-' + path,
+                            'The web user %s left %s in %s: %s.' % (owner, 'a program' if elf else 'an executable script', tmp, path),
+                            fix='Look at it, delete it if you do not know it, and check the sites of that user for a web shell.')
+    for u in users:
+        try:
+            pw = pwd.getpwnam(u)
+        except KeyError:
+            continue
+        for cron in ('/var/spool/cron/crontabs/' + u, '/var/spool/cron/' + u, '/etc/crontabs/' + u):
+            text = read(cron)
+            if not text:
+                continue
+            lines = [l for l in text.splitlines() if l.strip() and not l.strip().startswith('#') and not re.match(r'^\s*\w+=', l)]
+            bad = [l for l in lines if CRON_BAD.search(l)]
+            unknown = [l for l in lines if l not in bad and not CRON_OK.search(l)]
+            digest = hashlib.sha1(text.encode()).hexdigest()[:12]
+            if bad:
+                ctx.add('critical', 'intrusion', 'cron-%s-%s' % (u, digest), 'The web user %s has suspicious scheduled tasks (%s).' % (u, cron),
+                        '\n'.join(short(l, 200) for l in bad[:5]), 'Malware uses crontabs to come back after you delete it. Remove the lines you did not add: `crontab -u %s -e`.' % u)
+            elif unknown:
+                ctx.add('warning', 'intrusion', 'cron-%s-%s' % (u, digest), 'The web user %s has scheduled tasks (%s); check you added them.' % (u, cron),
+                        '\n'.join(short(l, 200) for l in unknown[:5]), 'If they are yours, add this key to IGNORE in the config.')
+        for keys in ('.ssh/authorized_keys', '.ssh/authorized_keys2'):
+            path = os.path.join(pw.pw_dir, keys)
+            text = read(path)
+            if text and text.strip():
+                n = len([l for l in text.splitlines() if l.strip() and not l.startswith('#')])
+                digest = hashlib.sha1(text.encode()).hexdigest()[:12]
+                prior = [k for k in ctx.seen if k.startswith('intrusion:sshkeys-%s-' % u) and not k.endswith(digest)]
+                ctx.add('critical' if prior else 'warning', 'intrusion', 'sshkeys-%s-%s' % (u, digest),
+                        '%s for the web user %s (%s): %s.' % ('SSH keys changed' if prior else 'SSH keys exist', u, path, plural(n, 'key')),
+                        fix='Web users normally have no SSH keys. Remove keys you do not know; if they are yours, add this key to IGNORE.')
+    if getattr(ctx, 'walk_cut', None):
+        ctx.add('warning', 'intrusion', 'walk-cut', 'Stopped looking for web shells after %s files (at %s); the rest were not read.' % (
+            '{:,}'.format(MAX_WEB_FILES), ctx.walk_cut),
+            fix='Add folders that are never served (old releases, backups) to SKIP_PATHS, or point SCAN_PATHS at the live sites.')
+    crashes = fpm_crashes(ctx)
+    if crashes:
+        ctx.add('critical' if crashes >= 20 else 'warning', 'intrusion', 'fpm-crashes', 'PHP workers crashed %s in the last 24 hours (segmentation faults).' % plural(crashes, 'time'),
+                'Crashes can be a PHP or extension bug, or someone probing for a memory-corruption exploit.',
+                'Look at the PHP-FPM log for the URLs at those times, and make sure PHP has every security update.')
+    read_what = 'read %s PHP files%s' % ('{:,}'.format(scanned), ' (full scan)' if ctx.deep else ' changed in the last %d days' % ctx.conf['INTRUSION_DAYS'])
+    if not [f for f in ctx.findings if f.check == 'intrusion' and f.level in ATTENTION]:
+        ctx.add('ok', 'intrusion', 'clean', 'No signs of intrusion (%s, upload folders, temp folders, processes, crontabs, SSH keys, crashes).' % read_what)
+    else:
+        ctx.add('info', 'intrusion', 'coverage', 'Web shell search: %s.' % read_what)
+
+
+def fpm_crashes(ctx):
+    count = 0
+    cutoff = datetime.datetime.now() - datetime.timedelta(hours=24)
+    for log in glob.glob('/var/log/php*fpm*.log') + glob.glob('/var/log/php-fpm/*.log') + glob.glob('/var/opt/remi/php*/log/php-fpm/*.log'):
+        try:
+            size = os.path.getsize(log)
+            with open(log, 'rb') as f:
+                f.seek(max(0, size - 2 * 1024 * 1024))
+                text = f.read().decode('utf-8', 'replace')
+        except OSError:
+            continue
+        for m in re.finditer(r'^\[(\d{2}-\w{3}-\d{4} \d{2}:\d{2}:\d{2})[^\]]*\].*exited on signal (11|7|6|4)\b', text, re.M):
+            try:
+                if datetime.datetime.strptime(m.group(1), '%d-%b-%Y %H:%M:%S') >= cutoff:
+                    count += 1
+            except ValueError:
+                pass
+    if which('journalctl'):
+        rc, out, _ = sh(['journalctl', '-q', '--no-pager', '-o', 'cat', '-k', '--since', '-24h'], timeout=60)
+        count += len(re.findall(r'(php|lsphp)[^\n]*segfault at', out or ''))
+    return count
+
+
+# ---------------------------------------------------------------- check: sites
+
+HOST_RX = re.compile(r'^(?=.{1,253}$)([a-z0-9-]{1,63}\.)+[a-z]{2,63}$')
+
+
+def site_hosts(ctx):
+    want = ctx.conf['CHECK_URLS'].strip()
+    if want == 'none':
+        return []
+    if want != 'auto':
+        hosts = []
+        for item in want.split():
+            u = urllib.parse.urlparse(item if '//' in item else '//' + item)
+            if u.hostname:
+                hosts.append(u.hostname.lower())
+        return sorted(set(hosts))
+    names = set()
+    if which('nginx'):
+        rc, out, _ = sh([which('nginx'), '-T'], timeout=60)
+        for m in re.finditer(r'^\s*server_name\s+([^;]+);', out or '', re.M):
+            names.update(m.group(1).split())
+    for ctl in ('apachectl', 'apache2ctl', 'httpd'):
+        if which(ctl):
+            rc, out, err = sh([which(ctl), '-S'], timeout=60)
+            for m in re.finditer(r'(?:namevhost|alias)\s+(\S+)', (out or '') + (err or '')):
+                names.add(m.group(1))
+            break
+    for conf in glob.glob('/etc/caddy/Caddyfile'):
+        for m in re.finditer(r'^([a-z0-9.\-, ]+)\s*\{', read(conf) or '', re.M):
+            names.update(x.strip() for x in m.group(1).split(','))
+    out = sorted(set(n.lower().strip() for n in names if HOST_RX.match(n.lower().strip()) and not
+                     re.search(r'(^|\.)(localhost|local|test|example|invalid|internal|lan)$', n.lower())))
+    return out[:60]
+
+
+def http_probe(host, path='/', timeout=8):
+    """GET https://host/path against this server (127.0.0.1 first, then DNS). Returns dict."""
+    res = {'host': host, 'path': path, 'status': None, 'error': '', 'cert_days': None, 'cert_error': '', 'body': b''}
+    targets = [('127.0.0.1', 443, True), ('127.0.0.1', 80, False)]
+    try:
+        ip = socket.gethostbyname(host)
+        targets += [(ip, 443, True), (ip, 80, False)]
+    except (socket.error, UnicodeError):
+        pass
+    for ip, port, tls in targets:
+        try:
+            s = socket.create_connection((ip, port), timeout=timeout)
+        except (socket.error, OSError) as e:
+            res['error'] = str(e)
+            continue
+        try:
+            if tls:
+                try:
+                    s2 = ssl.create_default_context().wrap_socket(s, server_hostname=host)
+                    na = s2.getpeercert().get('notAfter')
+                    if na:
+                        res['cert_days'] = int((ssl.cert_time_to_seconds(na) - time.time()) // 86400)
+                except (ssl.SSLError, ssl.CertificateError, socket.error) as e:
+                    res['cert_error'] = short(e, 120)
+                    s.close()
+                    s = socket.create_connection((ip, port), timeout=timeout)
+                    c = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT) if hasattr(ssl, 'PROTOCOL_TLS_CLIENT') else ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+                    c.check_hostname = False
+                    c.verify_mode = ssl.CERT_NONE
+                    s2 = c.wrap_socket(s, server_hostname=host)
+                s = s2
+            s.sendall(('GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\nConnection: close\r\n\r\n' % (path, host, UA)).encode())
+            data = b''
+            while len(data) < 65536:
+                chunk = s.recv(16384)
+                if not chunk:
+                    break
+                data += chunk
+            m = re.match(rb'HTTP/\d(?:\.\d)? (\d{3})', data)
+            res['status'] = int(m.group(1)) if m else None
+            res['body'] = data.split(b'\r\n\r\n', 1)[1] if b'\r\n\r\n' in data else b''
+            res['tls'] = tls
+            res['error'] = '' if m else 'no HTTP answer'
+            return res
+        except (socket.error, ssl.SSLError, OSError) as e:
+            res['error'] = short(e, 120)
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+    return res
+
+
+def probe_sites(ctx, paths=('/',)):
+    hosts = site_hosts(ctx)
+    jobs = [(h, p) for h in hosts for p in paths]
+    out = {}
+    if not jobs:
+        return out
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for r in pool.map(lambda hp: http_probe(hp[0], hp[1]), jobs):
+            out[(r['host'], r['path'])] = r
+    return out
+
+
+def site_ok(r):
+    return r is not None and r['status'] is not None and r['status'] < 500
+
+
+EXPOSURE = [
+    ('/.env', 'critical', 'The .env file (database passwords, API keys) is public', lambda b: re.search(rb'^(APP_KEY|DB_PASSWORD|DB_HOST|APP_ENV|MAIL_PASSWORD|SECRET|AWS_)[A-Z_]*=', b, re.M) and not re.search(rb'<html', b[:500], re.I)),
+    ('/.git/HEAD', 'critical', 'The .git folder is public (the full source code and its history can be downloaded)', lambda b: b.lstrip().startswith(b'ref: refs/')),
+    ('/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php', 'critical', 'PHPUnit eval-stdin.php is reachable (CVE-2017-9841: anyone can run code)', lambda b: len(b.strip()) < 64),
+    ('/phpinfo.php', 'warning', 'A phpinfo() page is public (it shows paths, versions and settings)', lambda b: b'phpinfo()' in b or b'PHP Version' in b),
+    ('/info.php', 'warning', 'A phpinfo() page is public (it shows paths, versions and settings)', lambda b: b'phpinfo()' in b or b'PHP Version' in b),
+]
+
+
+def check_sites(ctx):
+    hosts = site_hosts(ctx)
+    if not hosts:
+        ctx.add('info', 'sites', 'none', 'No sites to check (set CHECK_URLS, or no nginx/apache/caddy host names found).')
+        return
+    now = probe_sites(ctx)
+    broken = []
+    for h in hosts:
+        r = now.get((h, '/'))
+        before = (ctx.sites_before or {}).get((h, '/'))
+        if ctx.sites_before is not None and site_ok(before) and not site_ok(r):
+            ctx.add('critical', 'sites', 'broke-' + h, '%s answered before tonight\'s changes and now fails (%s).' % (
+                h, r['status'] or r['error']), fix='Look at the web server and PHP-FPM error logs right away.')
+        elif not site_ok(r):
+            broken.append('%s (%s)' % (h, r['status'] or short(r['error'], 40)))
+        if r.get('cert_days') is not None and r['cert_days'] < 14:
+            ctx.add('warning' if r['cert_days'] >= 0 else 'critical', 'sites', 'cert-' + h, 'The TLS certificate of %s %s.' % (
+                h, 'expires in %d days' % r['cert_days'] if r['cert_days'] >= 0 else 'has expired'),
+                fix='Renew it (certbot renew) and check the renewal timer.')
+        elif 'expired' in r.get('cert_error', ''):
+            ctx.add('warning', 'sites', 'cert-' + h, 'The TLS certificate %s serves on this server has expired.' % h,
+                    'Visitors may not notice if a CDN sits in front, but the origin certificate needs renewing.', 'Renew it.')
+    if broken:
+        ctx.add('warning', 'sites', 'down', '%s do not answer properly: %s.' % (plural(len(broken), 'site'), listing(broken, 6)),
+                fix='Check the web server and PHP-FPM logs for these hosts.')
+    exposed = probe_sites(ctx, tuple(p for p, _, _, _ in EXPOSURE))
+    for h in hosts:
+        for path, level, title, test in EXPOSURE:
+            r = exposed.get((h, path))
+            if r and r['status'] == 200 and test(r['body'] or b''):
+                ctx.add(level, 'sites', 'exposed-%s%s' % (h, path), '%s: https://%s%s' % (title, h, path),
+                        fix='Block it in the web server (deny all for that path) and point the document root at the public folder only.')
+    ok = len([h for h in hosts if site_ok(now.get((h, '/')))])
+    ctx.add('ok' if ok == len(hosts) else 'info', 'sites', 'summary', '%d of %s answer%s.' % (
+        ok, plural(len(hosts), 'site'), ' before and after the changes' if ctx.sites_before is not None else ''))
+
+
+# ---------------------------------------------------------------- report, state and notifications
+
+def summary(ctx):
+    c = dict((l, 0) for l in LEVELS)
+    for f in ctx.findings:
+        c[f.level] += 1
+    return c
+
+
+def headline(c):
+    need = c['critical'] + c['warning']
+    parts = []
+    if need:
+        parts.append('%d need%s attention' % (need, 's' if need == 1 else ''))
+    if c['fixed']:
+        parts.append('%d fixed' % c['fixed'])
+    if not need:
+        parts.insert(0, 'all good')
+    return ', '.join(parts)
+
+
+def render_text(ctx, c, finished):
+    host = socket.getfqdn()
+    lines = ['php-security-watch %s - %s - %s' % (VERSION, host, time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(finished))),
+             '%s - mode %s%s' % (ctx.osr.get('PRETTY_NAME', 'Linux'), 'fix' if ctx.fix else 'report', ', full intrusion scan' if ctx.deep else ''),
+             '', 'Result: %s (%d critical, %d warning, %d fixed, %d info, %d ok)' % (
+                 headline(c), c['critical'], c['warning'], c['fixed'], c['info'], c['ok'])]
+    sections = [('NEEDS ATTENTION', ATTENTION), ('FIXED THIS RUN', ('fixed',)), ('CHECKED', ('info', 'ok'))]
+    order = [n for n, _ in CHECKS]
+    for title, levels in sections:
+        rows = [f for f in ctx.findings if f.level in levels]
+        if not rows:
+            continue
+        rows.sort(key=lambda f: (RANK[f.level] if title != 'CHECKED' else 0, order.index(f.check) if f.check in order else 99))
+        lines += ['', title]
+        for f in rows:
+            lines.append('[%s] %-9s %s%s' % (f.level, f.check, f.title, '  (new)' if f.new else ''))
+            if f.detail and f.level != 'ok':
+                lines += ['      ' + l for l in str(f.detail).splitlines()]
+            if f.fix and f.level in ATTENTION + ('info',):
+                lines.append('      Fix: ' + f.fix)
+    src = ', '.join('%s %s' % (k, v) for k, v in sorted(ctx.sources.items()))
+    lines += ['', 'Sources: ' + (src or 'none needed'), 'Took %d s. %s' % (finished - ctx.started, REPO)]
+    return '\n'.join(lines) + '\n'
+
+
+def render_json(ctx, c, finished):
+    return {'tool': 'php-security-watch', 'version': VERSION, 'host': socket.getfqdn(),
+            'os': ctx.osr.get('PRETTY_NAME', ''), 'mode': 'fix' if ctx.fix else 'report', 'deep_scan': ctx.deep,
+            'started': utc(ctx.started), 'finished': utc(finished),
+            'summary': c, 'headline': headline(c), 'sources': ctx.sources,
+            'findings': [f.as_dict() for f in sorted(ctx.findings, key=lambda f: RANK[f.level])]}
+
+
+def state_dir(conf):
+    d = conf['STATE_DIR']
+    try:
+        os.makedirs(os.path.join(d, 'reports'), mode=0o700, exist_ok=True)
+        if os.access(d, os.W_OK):
+            return d
+    except OSError:
+        pass
+    d = os.path.join(os.path.expanduser('~'), '.cache', 'php-security-watch')
+    os.makedirs(os.path.join(d, 'reports'), mode=0o700, exist_ok=True)
+    return d
+
+
+def load_seen(d):
+    try:
+        with open(os.path.join(d, 'seen.json'), encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, IOError, ValueError):
+        return None
+
+
+def write_file(path, text, mode=0o600):
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def save_reports(d, text, data):
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    write_file(os.path.join(d, 'reports', stamp + '.txt'), text)
+    write_file(os.path.join(d, 'reports', stamp + '.json'), json.dumps(data, indent=2))
+    write_file(os.path.join(d, 'last.txt'), text)
+    write_file(os.path.join(d, 'last.json'), json.dumps(data, indent=2))
+    files = sorted(glob.glob(os.path.join(d, 'reports', '*')))
+    for old in files[:-120]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
+def log_run(d, line):
+    path = os.path.join(d, 'runs.log')
+    lines = (read(path) or '').splitlines()[-499:] + [line]
+    write_file(path, '\n'.join(lines) + '\n')
+
+
+def mark_new(ctx, seen):
+    now = time.time()
+    keys = seen.setdefault('keys', {})
+    remind = ctx.conf['REMIND_DAYS'] * 86400
+    for f in ctx.findings:
+        if f.level not in ATTENTION:
+            continue
+        s = keys.get(f.key)
+        if not s or now - s.get('notified', 0) >= remind or (s.get('level') == 'warning' and f.level == 'critical'):
+            f.new = True
+
+
+def should_notify(ctx, seen):
+    c = summary(ctx)
+    attention = c['critical'] + c['warning']
+    when = ctx.conf['NOTIFY_WHEN']
+    if when == 'always':
+        return True, 'always'
+    if when == 'attention':
+        return bool(attention or c['fixed']), 'attention'
+    if any(f.new for f in ctx.findings) or c['fixed']:
+        return True, 'new'
+    wd = ctx.conf['DIGEST_WEEKDAY']
+    if wd and today().isoweekday() == wd and seen.get('digest') != today().isoformat():
+        return True, 'weekly digest'
+    return False, ''
+
+
+def update_seen(ctx, seen, notified):
+    now = time.time()
+    keys = seen.setdefault('keys', {})
+    current = set()
+    for f in ctx.findings:
+        if f.level not in ATTENTION:
+            continue
+        current.add(f.key)
+        s = keys.setdefault(f.key, {'first': now, 'notified': 0})
+        s['level'], s['title'], s['last'] = f.level, f.title, now
+        if notified and f.new:
+            s['notified'] = now
+    for k in list(keys):
+        if k not in current:
+            del keys[k]
+    if notified:
+        seen['digest'] = today().isoformat()
+    return seen
+
+
+def subject_line(ctx, c):
+    return '[php-security-watch] %s: %s' % (socket.gethostname(), headline(c))
+
+
+def send_email(conf, subject, body):
+    to = [x for x in re.split(r'[,\s]+', conf['NOTIFY_EMAIL']) if x]
+    sender = conf['MAIL_FROM'] or 'php-security-watch@%s' % socket.getfqdn()
+    msg = EmailMessage()
+    msg['Subject'], msg['From'], msg['To'] = subject, sender, ', '.join(to)
+    msg['Date'] = email.utils.formatdate(localtime=True)
+    msg['Message-ID'] = email.utils.make_msgid(domain=sender.split('@')[-1])
+    msg.set_content(body)
+    if conf['SMTP_URL']:
+        u = urllib.parse.urlparse(conf['SMTP_URL'])
+        port = u.port or (465 if u.scheme == 'smtps' else 587)
+        user = conf['SMTP_USER'] or urllib.parse.unquote(u.username or '')
+        password = conf['SMTP_PASSWORD'] or urllib.parse.unquote(u.password or '')
+        if conf['SMTP_PASSWORD_FILE']:
+            password = (read(conf['SMTP_PASSWORD_FILE']) or '').strip()
+        tls = ssl.create_default_context()
+        if u.scheme == 'smtps':
+            s = smtplib.SMTP_SSL(u.hostname, port, timeout=30, context=tls)
+        else:
+            s = smtplib.SMTP(u.hostname, port, timeout=30)
+            s.ehlo()
+            if s.has_extn('starttls'):
+                s.starttls(context=tls)
+                s.ehlo()
+        try:
+            if user:
+                s.login(user, password)
+            s.send_message(msg)
+        finally:
+            try:
+                s.quit()
+            except Exception:
+                pass
+        return
+    sendmail = which('sendmail') or '/usr/sbin/sendmail'
+    if not os.path.exists(sendmail):
+        raise RuntimeError('no SMTP_URL set and no sendmail on this server')
+    rc, out, err = sh([sendmail, '-t', '-oi'], stdin=msg.as_string(), timeout=60)
+    if rc != 0:
+        raise RuntimeError('sendmail failed: ' + short(err or out, 200))
+
+
+def webhook_format(url, fmt):
+    if fmt != 'auto':
+        return fmt
+    host = (urllib.parse.urlparse(url).hostname or '').lower()
+    if host.endswith('slack.com'):
+        return 'slack'
+    if 'discord' in host:
+        return 'discord'
+    if host == 'api.telegram.org':
+        return 'telegram'
+    if host.startswith('ntfy.') or '/ntfy' in url:
+        return 'ntfy'
+    return 'json'
+
+
+def send_webhook(conf, subject, ctx, data):
+    url = conf['WEBHOOK_URL']
+    fmt = webhook_format(url, conf['WEBHOOK_FORMAT'])
+    att = [f for f in sorted(ctx.findings, key=lambda f: RANK[f.level]) if f.level in ATTENTION + ('fixed',)]
+    lines = [subject] + ['- [%s] %s%s' % (f.level, f.title, ' (new)' if f.new else '') for f in att[:15]]
+    if len(att) > 15:
+        lines.append('... and %d more in %s/last.txt' % (len(att) - 15, conf['STATE_DIR']))
+    text = '\n'.join(lines)
+    headers = {'User-Agent': UA}
+    if fmt == 'slack':
+        body, ctype = json.dumps({'text': text[:3500]}).encode(), 'application/json'
+    elif fmt == 'discord':
+        body, ctype = json.dumps({'content': text[:1900]}).encode(), 'application/json'
+    elif fmt == 'telegram':
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        body = json.dumps({'chat_id': (q.get('chat_id') or [''])[0], 'text': text[:4000], 'disable_web_page_preview': True}).encode()
+        ctype = 'application/json'
+    elif fmt == 'ntfy':
+        body, ctype = '\n'.join(lines[1:])[:3800].encode() or b'all good', 'text/plain; charset=utf-8'
+        headers.update({'Title': subject.encode('ascii', 'replace').decode(), 'Tags': 'warning' if summary(ctx)['critical'] else 'shield',
+                        'Priority': 'high' if summary(ctx)['critical'] else 'default'})
+    else:
+        body, ctype = json.dumps(data).encode(), 'application/json'
+    headers['Content-Type'] = ctype
+    req = urllib.request.Request(url, data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        r.read()
+
+
+def notify(ctx, subject, text, data):
+    """Returns (channels that worked, errors)."""
+    sent, errors = [], []
+    if ctx.conf['NOTIFY_EMAIL']:
+        try:
+            send_email(ctx.conf, subject, text)
+            sent.append('email')
+        except Exception as e:
+            errors.append('email: %s' % short(e, 200))
+    if ctx.conf['WEBHOOK_URL']:
+        try:
+            send_webhook(ctx.conf, subject, ctx, data)
+            sent.append('webhook')
+        except Exception as e:
+            errors.append('webhook: %s' % short(e, 200))
+    return sent, errors
+
+
+# ---------------------------------------------------------------- commands
+
+RUNNERS = {'os': check_os, 'patches': check_patches, 'reboot': check_reboot, 'php': check_php, 'services': check_services,
+           'runtimes': check_runtimes, 'libraries': check_libraries, 'wordpress': check_wordpress, 'news': check_news,
+           'intrusion': check_intrusion, 'sites': check_sites}
+
+
+def cmd_run(args, conf):
+    d = state_dir(conf)
+    lock = open(os.path.join(d, 'lock'), 'w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        lock.close()
+        sys.stderr.write('php-security-watch: another run is in progress\n')
+        return 2
+    try:
+        return run_locked(args, conf, d)
+    finally:
+        lock.close()
+
+
+def run_locked(args, conf, d):
+    ctx = Ctx(conf, args)
+    seen = load_seen(d)
+    ctx.deep = bool(args.deep) or seen is None or (conf['DIGEST_WEEKDAY'] and today().isoweekday() == conf['DIGEST_WEEKDAY'])
+    seen = seen or {}
+    ctx.seen = seen.get('keys', {})
+    only = [x.strip() for x in (args.only or '').split(',') if x.strip()] or [n for n, _ in CHECKS]
+    bad = [x for x in only if x not in RUNNERS]
+    if bad:
+        sys.stderr.write('php-security-watch: unknown check(s): %s (see `php-security-watch checks`)\n' % ', '.join(bad))
+        return 2
+    if not ctx.root:
+        ctx.add('warning', 'os', 'not-root', 'Ran without root: package, process, crontab and some file checks were limited.',
+                fix='Run it as root (the installed timer does).')
+    if conf['_unknown']:
+        ctx.add('warning', 'os', 'config-unknown', 'Unknown settings in %s: %s.' % (conf['_path'], ', '.join(conf['_unknown'])),
+                fix='Check the spelling against php-security-watch.conf.example.')
+    if ctx.fix and 'sites' in only:
+        ctx.sites_before = probe_sites(ctx)
+    for name, _ in CHECKS:
+        if name not in only:
+            continue
+        try:
+            RUNNERS[name](ctx)
+        except Exception as e:  # one broken check must never hide the others
+            ctx.add('warning', name, 'crashed', 'The %s check stopped with an error: %s: %s' % (name, type(e).__name__, short(e, 200)),
+                    fix='Please report it at %s/issues with this line.' % REPO)
+    for src, state in sorted(ctx.sources.items()):
+        if state != 'ok':
+            ctx.add('warning', 'news' if src in ('CISA KEV', 'Ubuntu tracker') else 'os', 'source-' + src,
+                    'Could not read %s: %s. The parts that depend on it were not checked.' % (src, state),
+                    fix='Check the server can reach it over HTTPS; it is retried on the next run.')
+    mark_new(ctx, seen)
+    finished = time.time()
+    c = summary(ctx)
+    data = render_json(ctx, c, finished)
+    text = render_text(ctx, c, finished)
+    save_reports(d, text, data)
+    notified, errors, why = [], [], ''
+    if not args.no_notify and (conf['NOTIFY_EMAIL'] or conf['WEBHOOK_URL']):
+        go, why = should_notify(ctx, seen)
+        if go:
+            notified, errors = notify(ctx, subject_line(ctx, c), text, data)
+    update_seen(ctx, seen, bool(notified))
+    write_file(os.path.join(d, 'seen.json'), json.dumps(seen, indent=1))
+    log_run(d, '%s %s critical=%d warning=%d fixed=%d deep=%s notified=%s%s took=%ds' % (
+        utc(time.time()), 'fix' if ctx.fix else 'report', c['critical'], c['warning'],
+        c['fixed'], 'yes' if ctx.deep else 'no', ','.join(notified) or 'no', ' errors=' + ';'.join(errors) if errors else '', finished - ctx.started))
+    if args.json:
+        print(json.dumps(data, indent=2))
+    elif not args.quiet:
+        sys.stdout.write(text)
+        if notified:
+            print('Notified by %s (%s).' % (' and '.join(notified), why))
+    for e in errors:
+        sys.stderr.write('php-security-watch: could not notify by %s\n' % e)
+    if errors:
+        return 2
+    return 1 if c['critical'] + c['warning'] else 0
+
+
+def cmd_status(args, conf):
+    d = state_dir(conf)
+    last = read(os.path.join(d, 'last.json'))
+    print('php-security-watch %s' % VERSION)
+    print('Config:   %s (mode %s, restart %s, notify %s)' % (conf['_path'], conf['MODE'], conf['RESTART_SERVICES'], ', '.join(
+        x for x, on in (('email', conf['NOTIFY_EMAIL']), ('webhook', conf['WEBHOOK_URL'])) if on) or 'off'))
+    print('State:    %s' % d)
+    if which('systemctl') and os.path.isdir('/run/systemd/system'):
+        rc, out, _ = sh(['systemctl', 'list-timers', 'php-security-watch.timer', '--no-pager', '--all'])
+        line = [l for l in out.splitlines() if 'php-security-watch' in l]
+        print('Timer:    %s' % (' '.join(line[0].split()[:4]) if line else 'not installed'))
+    elif os.path.exists('/etc/cron.d/php-security-watch') or 'php-security-watch' in (read('/etc/crontabs/root') or ''):
+        print('Schedule: cron')
+    if not last:
+        print('Last run: never')
+        return 0
+    data = json.loads(last)
+    print('Last run: %s - %s' % (data['finished'], data['headline']))
+    for f in data['findings']:
+        if f['level'] in ATTENTION:
+            print('  [%s] %s' % (f['level'], f['title']))
+    print('Full report: %s' % os.path.join(d, 'last.txt'))
+    return 0
+
+
+def cmd_test_notify(args, conf):
+    if not conf['NOTIFY_EMAIL'] and not conf['WEBHOOK_URL']:
+        print('No NOTIFY_EMAIL or WEBHOOK_URL in %s.' % conf['_path'])
+        return 2
+    ctx = Ctx(conf, args)
+    ctx.add('info', 'os', 'test', 'This is a test message from php-security-watch on %s.' % socket.getfqdn())
+    c = summary(ctx)
+    text = render_text(ctx, c, time.time())
+    sent, errors = notify(ctx, '[php-security-watch] %s: test message' % socket.gethostname(), text, render_json(ctx, c, time.time()))
+    for s in sent:
+        print('OK    %s' % s)
+    for e in errors:
+        print('FAIL  %s' % e)
+    return 0 if not errors else 2
+
+
+def cmd_checks(args, conf):
+    for name, desc in CHECKS:
+        print('%-10s %s' % (name, desc))
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog='php-security-watch', description='Nightly security watch for PHP servers. ' + REPO)
+    p.add_argument('--version', action='version', version='php-security-watch ' + VERSION)
+    p.add_argument('--config', default=os.environ.get('PSW_CONFIG', DEFAULT_CONFIG), help='config file (default %(default)s)')
+    sub = p.add_subparsers(dest='command')
+    r = sub.add_parser('run', help='run every check now')
+    r.add_argument('--apply', action='store_true', help='fix mode for this run (install security updates, restart per RESTART_SERVICES)')
+    r.add_argument('--no-notify', action='store_true', help='do not send email or webhook')
+    r.add_argument('--json', action='store_true', help='print the report as JSON')
+    r.add_argument('--quiet', action='store_true', help='print nothing (for cron and timers)')
+    r.add_argument('--deep', action='store_true', help='read every PHP file, not only recently changed ones')
+    r.add_argument('--only', help='comma separated checks, e.g. php,libraries')
+    sub.add_parser('status', help='show the last result and the next run')
+    sub.add_parser('test-notify', help='send a test email/webhook')
+    sub.add_parser('checks', help='list the checks')
+    args = p.parse_args(argv)
+    if not args.command:
+        p.print_help()
+        return 0
+    try:
+        conf = load_config(args.config, required=False)
+    except ConfigError as e:
+        sys.stderr.write('php-security-watch: %s\n' % e)
+        return 2
+    return {'run': cmd_run, 'status': cmd_status, 'test-notify': cmd_test_notify, 'checks': cmd_checks}[args.command](args, conf)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
