@@ -28,11 +28,10 @@ jobs:
       fail-fast: false
       matrix:
         python: ['3.9', '3.13']   # 3.6 is covered by the Rocky Linux 8 job
+    # A container, not setup-python: ubuntu-latest (26.04) has no Python 3.9 build.
+    container: python:${{ matrix.python }}-slim
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
       - run: python -W error -m py_compile php-security-watch
       - run: python -W error::ResourceWarning -m unittest discover -s tests -v
 
