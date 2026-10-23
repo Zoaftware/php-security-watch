@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1'   # weekly: the online sources it reads can change their format
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck
+        run: shellcheck install.sh uninstall.sh
+      - name: no sample web shells in the repository
+        run: "! grep -rIl --include='*.php' -e 'eval(' -e 'base64_decode' ."
+
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.13']   # 3.6 is covered by the Rocky Linux 8 job
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -W error -m py_compile php-security-watch
+      - run: python -W error::ResourceWarning -m unittest discover -s tests -v
+
+  # Install, run against a demo site with known-vulnerable libraries, then uninstall, on each system.
+  distro:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:24.04
+          - ubuntu:22.04
+          - debian:12
+          - rockylinux/rockylinux:9
+          - rockylinux/rockylinux:8
+          - alpine:3.20
+          - php:8.3-fpm
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: install
+        run: |
+          # Rocky 8 has no python3 by default: the installer must find /usr/libexec/platform-python on its own
+          case "${{ matrix.image }}" in
+            rockylinux/rockylinux:8) ./install.sh --no-timer ;;
+            *) ./install.sh --no-timer --deps ;;
+          esac
+          php-security-watch --version
+          test "$(stat -c %a /etc/php-security-watch.conf)" = 600
+      - name: demo site
+        run: |
+          mkdir -p /var/www/demo
+          cat > /var/www/demo/composer.lock <<'JSON'
+          {"packages": [{"name": "guzzlehttp/guzzle", "version": "7.4.0"}], "packages-dev": []}
+          JSON
+          cat > /var/www/demo/package-lock.json <<'JSON'
+          {"name": "demo", "lockfileVersion": 3, "packages": {"": {"name": "demo"}, "node_modules/lodash": {"version": "4.17.15"}}}
+          JSON
+      - name: run
+        run: |
+          rc=0
+          PSW_SCAN_PATHS=/var/www PSW_CHECK_URLS=none php-security-watch run --no-notify --json > /tmp/report.json || rc=$?
+          echo "exit code $rc"
+          test "$rc" -le 1
+          php-security-watch status
+      - name: it found the known flaws
+        run: |
+          PY=$(sed -n '1s/^#!//p' /usr/local/sbin/php-security-watch)
+          "$PY" - <<'PY'
+          import json
+          data = json.load(open('/tmp/report.json'))
+          libs = [f for f in data['findings'] if f['check'] == 'libraries' and f['level'] in ('critical', 'warning')]
+          text = json.dumps(libs)
+          for name in ('guzzlehttp/guzzle', 'lodash'):
+              assert name in text, '%s not reported: %s' % (name, text[:2000])
+          crashed = [f['title'] for f in data['findings'] if f['key'].endswith(':crashed')]
+          assert not crashed, crashed
+          print('ok:', data['headline'])
+          PY
+      - name: uninstall
+        run: |
+          ./uninstall.sh
+          test ! -e /usr/local/sbin/php-security-watch
+          test -e /etc/php-security-watch.conf
+          ./uninstall.sh --purge
+          test ! -e /etc/php-security-watch.conf
+          test ! -e /var/lib/php-security-watch
+
+  # The GitHub runner has systemd: check the timer is created and removed.
+  systemd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: install with a timer
+        run: |
+          sudo ./install.sh --time 04:30 --timezone UTC
+          # keep the run short on the runner: no big tool caches, no sites
+          printf 'SCAN_PATHS=/var/www\nCHECK_URLS=none\n' | sudo tee -a /etc/php-security-watch.conf
+          systemctl list-timers php-security-watch.timer --all | grep -q php-security-watch.timer
+          grep -q 'OnCalendar=\*-\*-\* 04:30:00 UTC' /etc/systemd/system/php-security-watch.timer
+      - name: run through systemd
+        run: |
+          sudo timeout 900 php-security-watch run --no-notify || test $? -le 1
+          sudo timeout 900 systemctl start php-security-watch.service
+          sudo systemctl status php-security-watch.service --no-pager || true
+          sudo test -s /var/lib/php-security-watch/last.json
+      - name: install again keeps the config
+        run: |
+          echo 'NOTIFY_WHEN=always' | sudo tee -a /etc/php-security-watch.conf
+          sudo ./install.sh --time 04:30
+          sudo grep -q '^NOTIFY_WHEN=always' /etc/php-security-watch.conf
+          sudo test -e /etc/php-security-watch.conf.new
+      - name: uninstall
+        run: |
+          sudo ./uninstall.sh --purge
+          ! systemctl list-timers --all | grep -q php-security-watch
+          test ! -e /etc/systemd/system/php-security-watch.timer
